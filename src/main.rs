@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -98,6 +98,16 @@ extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
     fn flock(fd: i32, operation: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn waitid(kind: i32, id: u32, info: *mut u64, options: i32) -> i32;
+    fn poll(fds: *mut PollFd, count: usize, timeout: i32) -> i32;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 extern "C" fn on_signal(sig: i32) {
@@ -288,32 +298,60 @@ fn run(prog: &str, args: &[&str], cwd: Option<&Path>) -> Res<Out> {
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = cmd.spawn().map_err(|e| format!("can't run {prog}: {e}"))?;
-    let mut stdout_pipe = child.stdout.take().ok_or("missing stdout pipe")?;
-    let mut stderr_pipe = child.stderr.take().ok_or("missing stderr pipe")?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        stdout_pipe.read_to_end(&mut b).map(|_| b)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        stderr_pipe.read_to_end(&mut b).map(|_| b)
-    });
-    let status = wait_child(&mut child, true)?;
-    let stdout = String::from_utf8_lossy(
-        &stdout_reader
-            .join()
-            .map_err(|_| "stdout reader failed")?
-            .map_err(|e| e.to_string())?,
-    )
-    .into_owned();
-    let stderr = String::from_utf8_lossy(
-        &stderr_reader
-            .join()
-            .map_err(|_| "stderr reader failed")?
-            .map_err(|e| e.to_string())?,
-    )
-    .into_owned();
+    let child = cmd.spawn().map_err(|e| format!("can't run {prog}: {e}"))?;
+    let mut child = CapturedChild {
+        child,
+        reaped: false,
+    };
+    let mut stdout_pipe = child.child.stdout.take().ok_or("missing stdout pipe")?;
+    let mut stderr_pipe = child.child.stderr.take().ok_or("missing stderr pipe")?;
+    nonblocking(stdout_pipe.as_raw_fd()).map_err(|e| e.to_string())?;
+    nonblocking(stderr_pipe.as_raw_fd()).map_err(|e| e.to_string())?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let (mut stdout_done, mut stderr_done) = (false, false);
+    let mut stopping = None;
+    loop {
+        let exited = child
+            .exited()
+            .map_err(|e| format!("waiting for child: {e}"))?;
+        if (interrupted() || exited) && stopping.is_none() {
+            child.signal(if interrupted() {
+                STOP_SIGNAL.load(Ordering::SeqCst)
+            } else {
+                15
+            });
+            stopping = Some(Instant::now());
+        }
+        if stopping.is_some_and(|t| t.elapsed() >= Duration::from_secs(5)) {
+            child.signal(9);
+        }
+        if !stdout_done {
+            stdout_done = drain_pipe(&mut stdout_pipe, &mut stdout).map_err(|e| e.to_string())?;
+        }
+        if !stderr_done {
+            stderr_done = drain_pipe(&mut stderr_pipe, &mut stderr).map_err(|e| e.to_string())?;
+        }
+        if exited && stdout_done && stderr_done {
+            break;
+        }
+        // A descendant that deliberately escaped the process group can retain a pipe.
+        // Bound that wait too; dropping the pipes must not strand reader threads.
+        if stopping.is_some_and(|t| t.elapsed() >= Duration::from_secs(6)) {
+            return Err(if interrupted() {
+                STOPPED.into()
+            } else {
+                "command exited but descendants kept its output pipes open".into()
+            });
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Keep the leader unreaped until the last group signal, pinning its PID/PGID
+    // so cleanup can never signal an unrelated, recycled process group.
+    child.signal(9);
+    let status = child.child.wait().map_err(|e| e.to_string())?;
+    child.reaped = true;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     log(&stdout);
     log(&stderr);
     if interrupted() {
@@ -325,6 +363,86 @@ fn run(prog: &str, args: &[&str], cwd: Option<&Path>) -> Res<Out> {
         stdout,
         stderr,
     })
+}
+
+struct CapturedChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl CapturedChild {
+    fn signal(&self, sig: i32) {
+        unsafe {
+            kill(-(self.child.id() as i32), sig);
+        }
+    }
+
+    fn exited(&self) -> io::Result<bool> {
+        // Linux siginfo_t is 128 bytes. Only si_signo is inspected; waitid with
+        // WNOWAIT observes exit without reaping the process-group leader.
+        let mut info = [0u64; 16];
+        let rc = unsafe {
+            waitid(
+                1, /* P_PID */
+                self.child.id(),
+                info.as_mut_ptr(),
+                4 /* WEXITED */ | 1 /* WNOHANG */ | 0x01000000, /* WNOWAIT */
+            )
+        };
+        if rc == 0 {
+            Ok(info[0] != 0)
+        } else {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.signal(9);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe {
+        fcntl(fd, 3 /* F_GETFL */)
+    };
+    if flags < 0
+        || unsafe {
+            fcntl(
+                fd,
+                4,             /* F_SETFL */
+                flags | 0x800, /* O_NONBLOCK */
+            )
+        } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_pipe(pipe: &mut impl Read, output: &mut Vec<u8>) -> io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    // Bound each batch so a continuously writing child cannot starve signals
+    // or the other pipe.
+    for _ in 0..16 {
+        match pipe.read(&mut buf) {
+            Ok(0) => return Ok(true),
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
 }
 
 fn wait_child(child: &mut std::process::Child, group: bool) -> Res<std::process::ExitStatus> {
@@ -454,7 +572,9 @@ impl Lock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(0x20000 /* O_NOFOLLOW on Linux */)
+            // O_NOFOLLOW|O_CLOEXEC: Rust also sets CLOEXEC by default; keep it
+            // explicit so a future custom_flags change cannot drop it.
+            .custom_flags(0x20000 | 0x80000 /* O_NOFOLLOW | O_CLOEXEC on Linux */)
             .open(&path)
             .map_err(|e| format!("can't open {}: {e}", path.display()))?;
         if unsafe {
@@ -710,7 +830,193 @@ fn owners(path: &str) -> Option<Vec<String>> {
     Some(map.get(path).cloned().unwrap_or_default())
 }
 
+// Accept alien's generated layout, not arbitrary RPM programs. In particular,
+// a Debian description or filename must never become an RPM directive/macro.
+//
+// Invariant: after %% → % expansion, no package-controlled line may begin with
+// '%'. Doubling alone is not enough — "%%prep" becomes "%prep", which rpm then
+// treats as a real section header and may execute via rpmbuild. Fail closed on
+// any body line that, after stripping leading Unicode whitespace (and VT),
+// starts with '%'; also reject ASCII controls other than tab in free-text
+// bodies. Body text is split on '\n' only so a bare '\r' cannot hide a '%'
+// line. Checks run on the final text that is written into the sanitized spec.
+fn sanitize_spec(text: &str, pkg: &str) -> Res<String> {
+    let (prefix, rest) = text
+        .split_once("\n%description\n")
+        .ok_or("alien's spec has no description section")?;
+    let (description, files) = rest
+        .rsplit_once("\n%files\n")
+        .ok_or("alien's spec has no files section")?;
+    let mut clean = String::new();
+    let mut in_script = false;
+    let mut script_field = "";
+    let mut script_line = 0usize;
+    let mut headers = HashSet::new();
+    // Split on '\n' only (not str::lines): a bare '\r' must remain in-line so
+    // it cannot hide a leading '%' from the body checks below.
+    for line in prefix.split('\n') {
+        if matches!(line, "%pre" | "%post" | "%preun" | "%postun") {
+            if !headers.insert(line.to_string()) {
+                return Err("duplicate script section in alien spec".into());
+            }
+            in_script = true;
+            script_field = line;
+            script_line = 0;
+            writeln!(clean, "{line}").unwrap();
+        } else if in_script {
+            script_line += 1;
+            // Alien already doubles percent signs in encoded scripts. Preserve
+            // that quoting, and neutralize any unescaped RPM macros as well.
+            // Reject on this final emitted line (not the pre-transform copy).
+            let emitted = line.replace("%%", "%").replace('%', "%%");
+            reject_body_controls(script_field, script_line, &emitted)?;
+            reject_leading_percent(script_field, script_line, &emitted)?;
+            writeln!(clean, "{emitted}").unwrap();
+        } else if line.is_empty() {
+            clean.push('\n');
+        } else if let Some(version) = line.strip_prefix("# deb2rpm Debian version: ") {
+            if !spec_version(version) {
+                return Err("invalid Debian version in spec".into());
+            }
+            writeln!(clean, "{line}").unwrap();
+        } else if matches!(
+            line,
+            "%define _rpmdir ../"
+                | "%define _rpmfilename %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm"
+                | "%define _unpackaged_files_terminate_build 0"
+        ) {
+            writeln!(clean, "{line}").unwrap();
+        } else {
+            let (key, value) = line
+                .split_once(':')
+                .ok_or("unexpected directive in alien spec")?;
+            if !matches!(
+                key,
+                "Buildroot"
+                    | "Name"
+                    | "Version"
+                    | "Release"
+                    | "Requires"
+                    | "Summary"
+                    | "License"
+                    | "Distribution"
+                    | "Group"
+            ) || !headers.insert(key.into())
+            {
+                return Err(format!("unexpected or duplicate spec field: {key}"));
+            }
+            // Single-line fields must not carry embedded newlines that could
+            // place package text at column 0 of a later physical line.
+            if value.contains('\n') || value.contains('\r') {
+                return Err(format!("invalid spec field: {key} (embedded newline)"));
+            }
+            if (key == "Name" && value.trim() != pkg)
+                || (matches!(key, "Version" | "Release") && !spec_version(value.trim()))
+                || value.chars().any(|c| c.is_control() && c != '\t')
+            {
+                return Err(format!("invalid spec field: {key}"));
+            }
+            writeln!(clean, "{key}:{}", value.replace('%', "%%")).unwrap();
+        }
+    }
+    for required in ["Name", "Version", "Release"] {
+        if !headers.contains(required) {
+            return Err(format!("missing spec field: {required}"));
+        }
+    }
+    let description_emitted = description.replace('%', "%%");
+    for (i, line) in description_emitted.split('\n').enumerate() {
+        reject_body_controls("%description", i + 1, line)?;
+        reject_leading_percent("%description", i + 1, line)?;
+    }
+    clean.push_str("%description\n");
+    clean.push_str(&description_emitted);
+    clean.push_str("\n%files\n");
+    // A quoted path must not span a newline (would put package text at col 0).
+    {
+        let mut in_quote = false;
+        for c in files.chars() {
+            match c {
+                '"' => in_quote = !in_quote,
+                '\n' | '\r' if in_quote => {
+                    return Err("unsafe filename in alien spec".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    for line in files.split('\n') {
+        if line.trim().is_empty() {
+            clean.push('\n');
+            continue;
+        }
+        let path = line
+            .strip_prefix("%dir ")
+            .or_else(|| line.strip_prefix("%config "))
+            .unwrap_or(line);
+        let path = path
+            .strip_prefix('"')
+            .and_then(|p| p.strip_suffix('"'))
+            .ok_or("unsupported file entry in alien spec")?;
+        if !path.starts_with('/')
+            || path.contains('"')
+            || path.contains('\\')
+            || path.contains('\n')
+            || path.contains('\r')
+            || path.chars().any(char::is_control)
+        {
+            return Err("unsafe filename in alien spec".into());
+        }
+        let directive = if line.starts_with("%dir ") {
+            "%dir "
+        } else if line.starts_with("%config ") {
+            "%config "
+        } else {
+            ""
+        };
+        writeln!(clean, "{directive}\"{}\"", path.replace('%', "%%")).unwrap();
+    }
+    Ok(clean)
+}
+
+fn reject_body_controls(field: &str, line_no: usize, line: &str) -> Res<()> {
+    for c in line.chars() {
+        if c.is_ascii_control() && c != '\t' {
+            return Err(format!(
+                "{field} line {line_no}: contains ASCII control character U+{:04X}, so the package is rejected",
+                c as u32
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn reject_leading_percent(field: &str, line_no: usize, line: &str) -> Res<()> {
+    // Match rpm's isspace()-style leading skip, including VT; also strip any
+    // Unicode whitespace (e.g. NBSP) so a disguised "%prep" cannot slip through.
+    let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '\x0b');
+    // Any leading '%' (case of the following name is irrelevant) becomes a
+    // section header after %% expansion; do not try to repair the text.
+    if trimmed.starts_with('%') {
+        return Err(format!(
+            "{field} line {line_no}: begins with '%'; after %% expansion rpm would parse this as a section header (e.g. %prep/%build/%files), so the package is rejected"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn spec_version(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".+:~_-".contains(c))
+}
+
 fn fix_spec(text: &str, pkg: &str, installing: bool) -> Res<SpecFix> {
+    let sanitized = sanitize_spec(text, pkg)?;
+    let text = sanitized.as_str();
     let mut out = String::with_capacity(text.len() + 1024);
     let mut dropped = Vec::new();
     let mut kept = 0usize;
@@ -983,7 +1289,15 @@ struct LibraryReport {
 
 fn elf_identity(path: &Path) -> Option<[u8; 4]> {
     let mut b = [0u8; 20];
-    fs::File::open(path).ok()?.read_exact(&mut b).ok()?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x800 /* O_NONBLOCK on Linux */)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.read_exact(&mut b).ok()?;
     if &b[..4] != b"\x7fELF" {
         return None;
     }
@@ -1195,9 +1509,45 @@ fn main() -> ExitCode {
     };
     if pause && !interrupted() {
         out("\nPress Enter to close… ");
-        let _ = io::stdin().lock().read_line(&mut String::new());
+        if let Err(e) = wait_for_enter() {
+            err_out(&format!("\nerror waiting for input: {e}\n"));
+            return ExitCode::FAILURE;
+        }
     }
-    code
+    if interrupted() {
+        ExitCode::from(130)
+    } else {
+        code
+    }
+}
+
+fn wait_for_enter() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut fd = PollFd {
+        fd: input.as_raw_fd(),
+        events: 1, /* POLLIN */
+        revents: 0,
+    };
+    while !interrupted() {
+        // A bounded poll closes the race between checking the flag and sleeping,
+        // even on platforms where signal() installs SA_RESTART.
+        let ready = unsafe { poll(&mut fd, 1, 50) };
+        if ready < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if ready > 0 && !interrupted() {
+            let mut byte = [0];
+            if input.read(&mut byte)? == 0 || byte[0] == b'\n' {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn convert(opts: Opts) -> Res<()> {
@@ -1248,10 +1598,7 @@ fn convert(opts: Opts) -> Res<()> {
             .is_some_and(|n| n.starts_with("work-"))
             && d.join(IN_PROGRESS).exists()
         {
-            info(&format!(
-                "found a leftover work directory: {}",
-                d.display()
-            ));
+            info(&format!("found a leftover work directory: {}", d.display()));
             if !opts.keep_work && !finish_work(&d, opts.delete_work) {
                 warn(&format!("couldn't clean {}", d.display()));
             }
@@ -1531,25 +1878,74 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
 mod tests {
     use super::*;
 
+    /// Serialize tests that spawn/fork with tests that assert flock release.
+    /// Under parallel cargo test, another thread's clone3(CLONE_VFORK) copies
+    /// the process fd table (including a held lock fd). Until that child closes
+    /// the CLOEXEC fd at exec, drop() of the lock does not release the OFD
+    /// flock, so a re-take sees EAGAIN. Confirmed via strace -f. Holding this
+    /// mutex for the whole test avoids that window — no retries or sleeps.
+    static FORK_LOCK_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn fork_lock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        FORK_LOCK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn temporary_dir(label: &str) -> PathBuf {
-        let d = env::temp_dir().join(format!("deb2rpm-test-{label}-{}", std::process::id()));
-        fs::create_dir_all(&d).unwrap();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = env::temp_dir().join(format!(
+            "deb2rpm-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir(&d).unwrap();
         d
     }
 
     #[test]
     fn live_lock_cannot_be_replaced() {
+        let _guard = fork_lock_test_guard();
         let d = temporary_dir("lock");
         let first = Lock::take(&d).unwrap();
         assert!(Lock::take(&d).is_err());
         drop(first);
-        assert!(Lock::take(&d).is_ok());
+        // Closing the fd releases the flock; a second take must succeed without
+        // retries. Retries would hide a real OFD/CLOEXEC leak.
+        let second = Lock::take(&d).unwrap();
+        drop(second);
         fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
+    fn lock_rejects_symlinked_lock_path() {
+        let _guard = fork_lock_test_guard();
+        let d = temporary_dir("lock-symlink");
+        let target = temporary_dir("lock-symlink-target");
+        fs::write(target.join("elsewhere"), b"x").unwrap();
+        std::os::unix::fs::symlink(target.join("elsewhere"), d.join("lock")).unwrap();
+        let err = match Lock::take(&d) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("symlinked lock path must be rejected"),
+        };
+        assert!(
+            err.contains("can't open") && err.contains("lock"),
+            "expected clear open failure for symlinked lock, got {err}"
+        );
+        // O_NOFOLLOW → ELOOP on Linux ("Too many levels of symbolic links").
+        assert!(
+            err.contains("symbolic link") || err.contains("Too many levels"),
+            "expected symlink/ELOOP detail, got {err}"
+        );
+        fs::remove_dir_all(d).unwrap();
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
     fn spec_keeps_automatic_dependencies() {
-        let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\n%files\n\"/opt/demo\"\n";
+        let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n\n%files\n\"/opt/demo\"\n";
         assert!(!fix_spec(spec, "demo", false)
             .unwrap()
             .text
@@ -1558,11 +1954,308 @@ mod tests {
 
     #[test]
     fn upgrade_scripts_preserve_versions() {
-        let spec = "Name: demo\nVersion: 2\nRelease: 1\n%pre\n#!/bin/sh\ntrue\n%post\n#!/bin/sh\ntrue\n%preun\n#!/bin/sh\ntrue\n%postun\n#!/bin/sh\ntrue\n%files\n";
+        let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%pre\n#!/bin/sh\ntrue\n%post\n#!/bin/sh\ntrue\n%preun\n#!/bin/sh\ntrue\n%postun\n#!/bin/sh\ntrue\n%description\nDemo\n\n%files\n";
         let fixed = fix_spec(spec, "demo", true).unwrap().text;
         assert!(fixed.contains("set -- upgrade \"$DEB2RPM_OLD\""));
         assert!(fixed.contains("set -- configure \"$DEB2RPM_OLD\""));
         assert!(fixed.contains("set -- upgrade \"$DEB2RPM_NEW\""));
+    }
+
+    fn alienish_spec(description: &str, scripts: &[(&str, &str)]) -> String {
+        // Layout mirrors alien 8.95's prep() output (Alien/Package/Rpm.pm).
+        let mut spec = String::from(
+            "Buildroot: /tmp/work\n\
+             Name: demo\n\
+             Version: 1\n\
+             Release: 1\n\
+             Summary: demo\n\
+             License: MIT\n\
+             Distribution: Debian\n\
+             Group: Converted/utils\n\
+             \n\
+             %define _rpmdir ../\n\
+             %define _rpmfilename %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm\n\
+             %define _unpackaged_files_terminate_build 0\n\
+             \n",
+        );
+        for (header, body) in scripts {
+            spec.push_str(header);
+            spec.push('\n');
+            spec.push_str(body);
+            if !body.is_empty() && !body.ends_with('\n') {
+                spec.push('\n');
+            }
+        }
+        spec.push_str("%description\n");
+        spec.push_str(description);
+        if !description.is_empty() && !description.ends_with('\n') {
+            spec.push('\n');
+        }
+        spec.push_str("\n%files\n\"/opt/demo\"\n");
+        spec
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_leading_percent_in_description() {
+        for injected in [
+            "%prep",
+            "  %prep",
+            "\t%build",
+            "%PREP",
+            "%files",
+            "%install",
+        ] {
+            let spec = alienish_spec(&format!("{injected}\ntouch marker\n"), &[]);
+            let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+            assert!(
+                err.contains("%description") && err.contains('%'),
+                "expected leading-% rejection for {injected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_leading_percent_in_each_scriptlet() {
+        for hook in ["%pre", "%post", "%preun", "%postun"] {
+            for injected in [
+                "%prep",
+                "  %prep",
+                "\t%build",
+                "%PREP",
+                "%files",
+                "%install",
+            ] {
+                // Alien doubles % in script bodies; both raw and doubled forms
+                // begin with '%' after whitespace strip and must be rejected.
+                let trimmed = injected.trim_start_matches([' ', '\t', '\r', '\u{0c}']);
+                let pad = &injected[..injected.len() - trimmed.len()];
+                let alien_doubled = format!("{pad}%{trimmed}");
+                for body in [
+                    format!("#!/bin/sh\n{injected}\ntouch marker\n"),
+                    format!("#!/bin/sh\n{alien_doubled}\ntouch marker\n"),
+                ] {
+                    let spec = alienish_spec("Demo\n", &[(hook, &body)]);
+                    let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+                    assert!(
+                        err.contains(hook) && err.contains('%'),
+                        "expected leading-% rejection in {hook} for {injected:?}, got {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_spec_accepts_mid_line_percent() {
+        let spec = alienish_spec("100% done\na %% b\n", &[]);
+        let clean = sanitize_spec(&spec, "demo").unwrap();
+        assert!(clean.contains("100%% done"));
+        assert!(clean.contains("a %%%% b"));
+        let with_scripts = alienish_spec(
+            "Demo\n",
+            &[("%pre", "#!/bin/sh\necho 100%% done\n")],
+        );
+        let clean = sanitize_spec(&with_scripts, "demo").unwrap();
+        // Alien-style %% in the script is normalized then re-doubled to %%.
+        assert!(clean.contains("100%% done"));
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_obscured_leading_percent_in_description() {
+        for injected in [
+            "\x0b%prep",
+            "\r%prep",
+            "\x0c%build",
+            "\u{a0}%install",
+            "  \t%files",
+        ] {
+            let spec = alienish_spec(&format!("{injected}\ntouch marker\n"), &[]);
+            let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+            assert!(
+                err.contains("%description"),
+                "expected rejection for {injected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_percent_prep_in_pre() {
+        let spec = alienish_spec("Demo\n", &[("%pre", "#!/bin/sh\n%prep\ntouch marker\n")]);
+        let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+        assert!(err.contains("%pre") && err.contains('%'), "{err}");
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_percent_prep_in_post() {
+        let spec = alienish_spec("Demo\n", &[("%post", "#!/bin/sh\n%prep\ntouch marker\n")]);
+        let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+        assert!(err.contains("%post") && err.contains('%'), "{err}");
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_percent_prep_in_preun() {
+        let spec = alienish_spec("Demo\n", &[("%preun", "#!/bin/sh\n%prep\ntouch marker\n")]);
+        let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+        assert!(err.contains("%preun") && err.contains('%'), "{err}");
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_percent_prep_in_postun() {
+        let spec = alienish_spec("Demo\n", &[("%postun", "#!/bin/sh\n%prep\ntouch marker\n")]);
+        let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+        assert!(err.contains("%postun") && err.contains('%'), "{err}");
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_embedded_newline_in_version_release_and_files() {
+        for key in ["Version", "Release"] {
+            let base = alienish_spec("Demo\n", &[]);
+            // Survives '\n'-only splitting as a single physical line with \r in the value.
+            let with_cr = base.replacen(&format!("{key}: 1\n"), &format!("{key}: 1\r%prep\n"), 1);
+            let err = sanitize_spec(&with_cr, "demo").unwrap_err().to_string();
+            assert!(
+                err.contains(key),
+                "expected {key} rejection for embedded CR, got {err}"
+            );
+            // Embedded LF splits the value across lines; the "%prep" fragment is rejected.
+            let with_lf = base.replacen(&format!("{key}: 1\n"), &format!("{key}: 1\n%prep\n"), 1);
+            assert!(
+                sanitize_spec(&with_lf, "demo").is_err(),
+                "expected rejection for {key} value split by \\n%prep"
+            );
+        }
+        let files_inject = alienish_spec("Demo\n", &[]).replacen(
+            "\"/opt/demo\"\n",
+            "\"/opt/demo\n%prep\"\n",
+            1,
+        );
+        let err = sanitize_spec(&files_inject, "demo").unwrap_err().to_string();
+        assert!(
+            err.contains("filename") || err.contains("file"),
+            "expected %files path rejection for embedded \\n%prep, got {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_spec_rejects_section_injection_before_rpmbuild() {
+        // Regression: a description line that is "%prep" must fail closed in
+        // sanitize_spec so rpmbuild is never reached with an injectable spec.
+        let spec = alienish_spec("%prep\ntouch /tmp/cursor-p1/marker\n", &[]);
+        let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
+        assert!(
+            err.contains("%description"),
+            "injection must be rejected by sanitize_spec: {err}"
+        );
+        assert!(
+            err.contains("line"),
+            "error must cite the offending line: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "documents P1: doubling-only turns %%prep into %prep under rpmbuild -bp"]
+    fn doubling_only_section_injection_executes_under_rpmbuild() {
+        let _guard = fork_lock_test_guard();
+        // Control: old neutralize-by-doubling behavior, without rejecting a
+        // leading '%'. Package text "%prep" becomes "%%prep" in the spec; rpm
+        // expands that back to "%prep" and rpmbuild -bp runs the following
+        // shell. Containment: only touch under /tmp/cursor-p1.
+        let root = Path::new("/tmp/cursor-p1");
+        let topdir = root.join("rpmbuild");
+        let marker = root.join("marker");
+        let _ = fs::remove_file(&marker);
+        for sub in ["SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS"] {
+            fs::create_dir_all(topdir.join(sub)).unwrap();
+        }
+        let buildroot = root.join("buildroot");
+        fs::create_dir_all(&buildroot).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let xdg = root.join("xdg");
+        fs::create_dir_all(xdg.join("config")).unwrap();
+        fs::create_dir_all(xdg.join("cache")).unwrap();
+        fs::create_dir_all(xdg.join("data")).unwrap();
+        fs::create_dir_all(xdg.join("state")).unwrap();
+        let tmp = root.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Old sanitize_spec behavior: double every % in the description body.
+        let package_description = "%prep\ntouch /tmp/cursor-p1/marker\n";
+        let doubled = package_description.replace('%', "%%");
+        assert_eq!(doubled.lines().next().unwrap(), "%%prep");
+        let spec = format!(
+            "Buildroot: {}\nName: demo\nVersion: 1\nRelease: 1\nSummary: demo\nLicense: MIT\n\
+             %description\n{doubled}\n%files\n",
+            buildroot.display()
+        );
+        let spec_path = topdir.join("SPECS/demo.spec");
+        fs::write(&spec_path, &spec).unwrap();
+        let rpmbuild = Path::new(RPMBUILD);
+        assert!(rpmbuild.exists(), "rpmbuild required for ignored P1 control");
+        let out = Command::new(rpmbuild)
+            .args([
+                "-bp",
+                "--define",
+                &format!("_topdir {}", topdir.display()),
+                spec_path.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", xdg.join("config"))
+            .env("XDG_CACHE_HOME", xdg.join("cache"))
+            .env("XDG_DATA_HOME", xdg.join("data"))
+            .env("XDG_STATE_HOME", xdg.join("state"))
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "expected doubling-only bug to execute marker; status={} stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn package_metadata_cannot_execute_rpm_macros() {
+        let _guard = fork_lock_test_guard();
+        // Layout mirrors alien 8.95's prep() output (Alien/Package/Rpm.pm): one
+        // blank line before the %defines (which are already %%-quoted there),
+        // License/Distribution/Group headers, a trailing "(Converted from a
+        // … package by alien …)" line inside the description, and quoted
+        // %files entries. Mid-line %(…) must be doubled; a leading '%' on a
+        // body line is rejected separately (see sanitize_spec_rejects_*).
+        let d = temporary_dir("spec-macro");
+        let marker = d.join("executed");
+        let buildroot = format!("{}/work", d.display());
+        let attack = format!("%(touch {})", marker.display());
+        let spec = format!(
+            "Buildroot: {buildroot}\nName: demo\nVersion: 1\nRelease: 1\nSummary: probe {attack}\nLicense: see /usr/share/doc/demo/copyright\nDistribution: Debian\nGroup: Converted/utils\n\n%define _rpmdir ../\n%define _rpmfilename %%{{NAME}}-%%{{VERSION}}-%%{{RELEASE}}.%%{{ARCH}}.rpm\n%define _unpackaged_files_terminate_build 0\n\n%description\nprobe {attack}\n\n(Converted from a deb package by alien version 8.95.)\n\n%files\n%dir \"/opt/\"\n%dir \"/opt/demo/\"\n\"/opt/demo/plain.txt\"\n"
+        );
+        let fixed = fix_spec(&spec, "demo", false).unwrap().text;
+        assert!(fixed.contains(&format!("Summary: probe %%(touch {}", marker.display())));
+        assert!(fixed.contains(&format!("%%(touch {}", marker.display())));
+
+        let rpmspec = Path::new("/usr/bin/rpmspec");
+        if rpmspec.exists() {
+            let path = d.join("demo.spec");
+            fs::write(&path, fixed).unwrap();
+            let home = d.join("home");
+            fs::create_dir_all(&home).unwrap();
+            let parsed = Command::new(rpmspec)
+                .args(["--parse", path.to_str().unwrap()])
+                .env("HOME", &home)
+                .env("TMPDIR", &d)
+                .output()
+                .unwrap();
+            assert!(
+                parsed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&parsed.stderr)
+            );
+            assert!(!marker.exists(), "RPM macro executed from package metadata");
+        }
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1585,6 +2278,7 @@ mod tests {
 
     #[test]
     fn library_scan_accepts_real_symlinks_but_rejects_text() {
+        let _guard = fork_lock_test_guard();
         let d = temporary_dir("libraries");
         fs::write(d.join("lib.c"), b"int audit_value(void) { return 42; }").unwrap();
         fs::write(
@@ -1633,7 +2327,64 @@ mod tests {
     }
 
     #[test]
+    fn library_scan_rejects_fifo_without_blocking() {
+        let _guard = fork_lock_test_guard();
+        let d = temporary_dir("fifo");
+        let fifo = d.join("library");
+        assert!(Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(elf_identity(&fifo), None);
+        std::os::unix::fs::symlink(&fifo, d.join("library-link")).unwrap();
+        assert_eq!(elf_identity(&d.join("library-link")), None);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn exited_child_does_not_wait_for_descendant_pipe() {
+        let _guard = fork_lock_test_guard();
+        let d = temporary_dir("descendant");
+        let pid_file = d.join("descendant.pid");
+        let pid_path = pid_file.to_str().unwrap();
+        let start = Instant::now();
+        let output = run(
+            "/bin/sh",
+            &[
+                "-c",
+                "sleep 10 & echo $! > \"$1\"; exit 0",
+                "worker",
+                pid_path,
+            ],
+            Some(&d),
+        )
+        .unwrap();
+        assert!(output.ok);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
+                .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
+            if state.as_deref().is_none_or(|state| state == "Z") {
+                fs::remove_dir_all(d).unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("descendant process {pid} survived captured-command cleanup");
+    }
+
+    #[test]
     fn scriptlets_receive_versions_and_record_failures() {
+        let _guard = fork_lock_test_guard();
         let d = temporary_dir("scriptlets");
         let state = d.join("demo");
         fs::create_dir_all(&state).unwrap();
@@ -1683,12 +2434,13 @@ mod tests {
     #[ignore = "worker subprocess for parent_signal_stops_child"]
     fn signal_worker() {
         install_signal_handlers();
-        assert!(run("/usr/bin/sleep", &["10"], None).is_err());
+        assert!(run("/bin/sh", &["-c", "sleep 10 & wait"], None).is_err());
         assert!(interrupted());
     }
 
     #[test]
     fn parent_signal_stops_child() {
+        let _guard = fork_lock_test_guard();
         let mut child = Command::new(env::current_exe().unwrap())
             .args(["--ignored", "--exact", "tests::signal_worker"])
             .stdout(Stdio::null())
@@ -1714,5 +2466,238 @@ mod tests {
         }
         assert!(child.wait().unwrap().success());
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    #[ignore = "worker subprocess for pause_signal_stops_input_wait"]
+    fn pause_signal_worker() {
+        install_signal_handlers();
+        fs::write(env::var_os("DEB2RPM_PAUSE_READY_FILE").unwrap(), b"ready").unwrap();
+        wait_for_enter().unwrap();
+        assert!(interrupted());
+    }
+
+    #[test]
+    fn pause_signal_stops_input_wait() {
+        let _guard = fork_lock_test_guard();
+        // SIGTERM must interrupt the input wait. Outside interference has been
+        // observed making a single kill delivery ineffective, so allow a few
+        // attempts: a real regression fails all of them.
+        let d = temporary_dir("pause");
+        let ready_file = d.join("ready");
+        let mut last = String::from("no attempt ran");
+        for attempt in 0..4 {
+            let mut child = Command::new(env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "tests::pause_signal_worker"])
+                .env("DEB2RPM_PAUSE_READY_FILE", ready_file.to_str().unwrap())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            while !ready_file.exists() {
+                assert!(start.elapsed() < Duration::from_secs(3));
+                assert!(child.try_wait().unwrap().is_none());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = fs::remove_file(&ready_file);
+            unsafe {
+                kill(child.id() as i32, 15);
+            }
+            let status = child.wait().unwrap();
+            match (status.code(), interrupted_signal_of(&status)) {
+                (Some(0), _) => {
+                    fs::remove_dir_all(d).unwrap();
+                    return;
+                }
+                _ => last = format!("attempt {attempt}: worker exited with {status:?}"),
+            }
+        }
+        panic!("wait_for_enter did not stop on SIGTERM; {last}");
+    }
+
+    fn interrupted_signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+
+    fn cursor_p1_env(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        let tmp = root.join("tmp");
+        for p in [
+            &home,
+            &tmp,
+            &xdg.join("config"),
+            &xdg.join("cache"),
+            &xdg.join("data"),
+            &xdg.join("state"),
+            &root.join("rpmbuild"),
+        ] {
+            fs::create_dir_all(p).unwrap();
+        }
+        // Keep rpmbuild contained if it were ever reached.
+        fs::write(
+            home.join(".rpmmacros"),
+            format!("%_topdir {}\n", root.join("rpmbuild").display()),
+        )
+        .unwrap();
+        (home, xdg, tmp)
+    }
+
+    fn build_hostile_deb(staging: &Path, description_attack: bool, postinst_attack: bool) -> PathBuf {
+        let root = staging.join("tree");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("DEBIAN")).unwrap();
+        fs::create_dir_all(root.join("usr/share/doc/p1probe")).unwrap();
+        fs::write(root.join("usr/share/doc/p1probe/README"), b"p1probe\n").unwrap();
+        let description = if description_attack {
+            "harmless summary\n %prep\n touch /tmp/cursor-p1/marker2\n"
+        } else {
+            "harmless summary\n"
+        };
+        fs::write(
+            root.join("DEBIAN/control"),
+            format!(
+                "Package: p1probe\n\
+                 Version: 1.0-1\n\
+                 Section: utils\n\
+                 Priority: optional\n\
+                 Architecture: all\n\
+                 Maintainer: P1 Probe <p1@example.invalid>\n\
+                 Installed-Size: 1\n\
+                 Description: {description}"
+            ),
+        )
+        .unwrap();
+        if postinst_attack {
+            fs::write(
+                root.join("DEBIAN/postinst"),
+                "#!/bin/sh\n%prep\ntouch /tmp/cursor-p1/marker2\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(root.join("DEBIAN/postinst"))
+                    .unwrap()
+                    .permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(root.join("DEBIAN/postinst"), perms).unwrap();
+            }
+        }
+        let deb = staging.join("p1probe_1.0-1_all.deb");
+        let out = Command::new(DPKG_DEB)
+            .args([
+                "-b",
+                "-Zgzip",
+                root.to_str().unwrap(),
+                deb.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "dpkg-deb failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        deb
+    }
+
+    fn deb2rpm_bin() -> PathBuf {
+        // Unit-test exe is the harness; build/run the real binary instead.
+        if let Some(p) = option_env!("CARGO_BIN_EXE_deb2rpm") {
+            return PathBuf::from(p);
+        }
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = Command::new(&cargo)
+            .args(["build", "-q", "--bin", "deb2rpm"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cargo build --bin deb2rpm failed");
+        let target = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+        target.join("debug/deb2rpm")
+    }
+
+    fn run_deb2rpm_contained(deb: &Path, root: &Path) -> std::process::Output {
+        let (home, xdg, tmp) = cursor_p1_env(root);
+        let bin = deb2rpm_bin();
+        assert!(bin.exists(), "missing deb2rpm binary at {}", bin.display());
+        Command::new(&bin)
+            .args(["-n", "--delete-work", deb.to_str().unwrap()])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", xdg.join("config"))
+            .env("XDG_CACHE_HOME", xdg.join("cache"))
+            .env("XDG_DATA_HOME", xdg.join("data"))
+            .env("XDG_STATE_HOME", xdg.join("state"))
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "P1 e2e: hostile Description .deb through real deb2rpm"]
+    fn e2e_hostile_description_deb_rejected_before_rpmbuild() {
+        let _guard = fork_lock_test_guard();
+        let marker = Path::new("/tmp/cursor-p1/marker2");
+        let _ = fs::remove_file(marker);
+        // Per-test HOME/XDG root so parallel e2e cases do not share deb2rpm/lock.
+        let root = Path::new("/tmp/cursor-p1/e2e-desc-root");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let deb = build_hostile_deb(&staging, true, false);
+        let out = run_deb2rpm_contained(&deb, root);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "deb2rpm should reject hostile description: {combined}"
+        );
+        assert!(
+            combined.contains("%description") && combined.contains("begins with '%'"),
+            "missing rejection message: {combined}"
+        );
+        assert!(
+            !combined.contains("Building the rpm"),
+            "rpmbuild step must not run: {combined}"
+        );
+        assert!(!marker.exists(), "marker2 must not exist");
+    }
+
+    #[test]
+    #[ignore = "P1 e2e: hostile postinst .deb through real deb2rpm"]
+    fn e2e_hostile_postinst_deb_rejected_before_rpmbuild() {
+        let _guard = fork_lock_test_guard();
+        let marker = Path::new("/tmp/cursor-p1/marker2");
+        let _ = fs::remove_file(marker);
+        let root = Path::new("/tmp/cursor-p1/e2e-postinst-root");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let deb = build_hostile_deb(&staging, false, true);
+        let out = run_deb2rpm_contained(&deb, root);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "deb2rpm should reject hostile postinst: {combined}"
+        );
+        assert!(
+            combined.contains("%post") && combined.contains("begins with '%'"),
+            "missing rejection message: {combined}"
+        );
+        assert!(
+            !combined.contains("Building the rpm"),
+            "rpmbuild step must not run: {combined}"
+        );
+        assert!(!marker.exists(), "marker2 must not exist");
     }
 }

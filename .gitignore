@@ -2,3 +2,5 @@ docs/
 target/
 build/
 dist/
+audit*
+!audit.md
