@@ -1179,6 +1179,31 @@ struct DependencyElf {
     needed: Vec<String>,
 }
 
+fn is_node_prebuild(path: &str) -> bool {
+    let Some((_, relative)) = path.rsplit_once("/node_modules/") else {
+        return false;
+    };
+    if path.ends_with(".node") {
+        return true;
+    }
+    // FFI packages also ship shared libraries. Limit these to files directly
+    // inside a platform-specific package, not arbitrary vendored .so files.
+    if !path.ends_with(".so") {
+        return false;
+    }
+    let parts: Vec<_> = relative.split('/').collect();
+    let expected = if relative.starts_with('@') { 3 } else { 2 };
+    if parts.len() != expected {
+        return false;
+    }
+    let package = parts[parts.len() - 2];
+    ["linux-x64", "linux-arm64"].iter().any(|platform| {
+        ["musl", "gnu", "glibc"]
+            .iter()
+            .any(|libc| package.ends_with(&format!("-{platform}-{libc}")))
+    })
+}
+
 // Only known Node prebuild layouts with an ELF-verified glibc counterpart are optional.
 // Keep dependencies for arbitrary foreign binaries and musl-only applications.
 fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
@@ -1189,7 +1214,7 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
     };
     let mut excluded = BTreeSet::new();
     for elf in elfs {
-        if !elf.path.contains("/node_modules/") || !elf.path.ends_with(".node") {
+        if !is_node_prebuild(&elf.path) {
             continue;
         }
         let foreign = elf.identity != identity;
@@ -1263,7 +1288,7 @@ fn prebuild_exclusions(tree: &Path, arch: &str) -> Res<Vec<String>> {
                         .to_str()
                         .ok_or("non-UTF-8 payload path")?
                 );
-                if !relative.contains("/node_modules/") || !relative.ends_with(".node") {
+                if !is_node_prebuild(&relative) {
                     continue;
                 }
                 let Some(identity) = elf_identity(&path) else {
@@ -2186,6 +2211,48 @@ mod tests {
     }
 
     #[test]
+    fn shared_library_prebuilds_require_a_verified_native_counterpart() {
+        let musl = "/opt/T3 Code (Beta)/resources/app.asar.unpacked/node_modules/@ff-labs/fff-bin-linux-x64-musl/libfff_c.so";
+        let native = musl.replace("-musl/", "-gnu/");
+        let elfs = vec![
+            addon(musl, 62, &["libc.so"]),
+            addon(&native, 62, &["libc.so.6"]),
+        ];
+        assert_eq!(
+            dependency_exclusions(&elfs, "x86_64"),
+            vec![musl.to_string()]
+        );
+        assert!(dependency_exclusions(&elfs[..1], "x86_64").is_empty());
+        for identity in [[2, 1, 183, 0], [1, 1, 62, 0], [2, 2, 0, 62]] {
+            let mut wrong = elfs.clone();
+            wrong[1].identity = identity;
+            assert!(dependency_exclusions(&wrong, "x86_64").is_empty());
+        }
+        let wrong_libc = vec![elfs[0].clone(), addon(&native, 62, &["libc.so"])];
+        assert!(dependency_exclusions(&wrong_libc, "x86_64").is_empty());
+        let unrelated_name = vec![
+            elfs[0].clone(),
+            addon(
+                &native.replace("libfff_c.so", "other.so"),
+                62,
+                &["libc.so.6"],
+            ),
+        ];
+        assert!(dependency_exclusions(&unrelated_name, "x86_64").is_empty());
+        for path in [
+            "/opt/lib-linux-x64-musl/libfff_c.so",
+            "/opt/app/node_modules/unrelated-musl/libfff_c.so",
+            "/opt/app/node_modules/pkg/vendor/lib-linux-x64-musl/libfff_c.so",
+        ] {
+            let elfs = vec![
+                addon(path, 62, &["libc.so"]),
+                addon(&path.replace("-musl/", "-gnu/"), 62, &["libc.so.6"]),
+            ];
+            assert!(dependency_exclusions(&elfs, "x86_64").is_empty(), "{path}");
+        }
+    }
+
+    #[test]
     fn dependency_regex_survives_rpm_expansion_as_literal_paths() {
         let paths = vec!["/opt/app+(1)/node_modules/a[2]/50%{name}.node".into()];
         let regex = dependency_exclude_regex(&paths);
@@ -2214,12 +2281,14 @@ mod tests {
         let _guard = fork_lock_test_guard();
         let work = temporary_dir("mixed-rpm");
         let tree = work.join("payload");
-        let modules = tree.join("opt/app/node_modules");
+        let modules = tree.join("opt/T3 Code (Beta)/node_modules");
         let native = modules.join("pty/prebuilds/linux-x64/pty.node");
         let foreign = modules.join("pty/prebuilds/linux-arm64/pty.node");
         let glibc = modules.join("watcher-linux-x64-glibc/watcher.node");
         let musl = modules.join("watcher-linux-x64-musl/watcher.node");
-        for p in [&native, &foreign, &glibc, &musl] {
+        let glibc_so = modules.join("@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so");
+        let musl_so = modules.join("@ff-labs/fff-bin-linux-x64-musl/libfff_c.so");
+        for p in [&native, &foreign, &glibc, &musl, &glibc_so, &musl_so] {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
         }
         fs::write(
@@ -2236,6 +2305,7 @@ mod tests {
             .unwrap()
             .success());
         fs::copy(&native, &glibc).unwrap();
+        fs::copy(&native, &glibc_so).unwrap();
         let mut bytes = fs::read(&native).unwrap();
         bytes[18] = 183; // a real dynamic ELF, with a foreign e_machine
         let soname = b"libnativeprobe.so";
@@ -2275,14 +2345,52 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        // Reproduce the FFI library's unversioned musl libc requirement.
+        let libc_so = work.join("libc.so");
+        assert!(Command::new("/usr/bin/gcc")
+            .args(["-shared", "-fPIC", "-nostdlib", "-Wl,-soname,libc.so"])
+            .arg(work.join("stub.c"))
+            .arg("-o")
+            .arg(&libc_so)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/gcc")
+            .args([
+                "-shared",
+                "-fPIC",
+                "-nostdlib",
+                "-Wl,--no-as-needed",
+                "-Wl,-soname,libmuslsoprobe.so"
+            ])
+            .arg(work.join("stub.c"))
+            .arg(&libc_so)
+            .arg("-o")
+            .arg(&musl_so)
+            .status()
+            .unwrap()
+            .success());
         let excluded = prebuild_exclusions(&tree, "x86_64").unwrap();
-        assert_eq!(excluded.len(), 2);
+        assert_eq!(excluded.len(), 3);
+        assert!(missing_libraries(&tree, &[])
+            .missing
+            .iter()
+            .any(|(lib, _)| lib == "libc.so"));
+        assert!(!missing_libraries(&tree, &excluded)
+            .missing
+            .iter()
+            .any(|(lib, _)| lib == "libc.so"));
         let spec = work.join("probe.spec");
-        fs::write(&spec, "Name: mixedprobe\nVersion: 1\nRelease: 1\nSummary: mixed ELF test\nLicense: MIT\n%description\nTest\n%files\n%defattr(-,root,root,-)\n/opt/app\n").unwrap();
+        fs::write(&spec, "Name: mixedprobe\nVersion: 1\nRelease: 1\nSummary: mixed ELF test\nLicense: MIT\n%description\nTest\n%files\n%defattr(-,root,root,-)\n\"/opt/T3 Code (Beta)\"\n").unwrap();
         let rpm = rpmbuild(&tree, &spec, "x86_64", &work, &excluded).unwrap();
         let requirements = run(RPM, &["-qp", "--requires", rpm.to_str().unwrap()], None).unwrap();
         assert!(requirements.ok);
         assert!(requirements.stdout.contains("libc.so.6(GLIBC_"));
+        assert!(
+            !requirements.stdout.contains("libc.so()(64bit)"),
+            "{}",
+            requirements.stdout
+        );
         assert!(
             !requirements.stdout.contains("musl"),
             "{}",
@@ -2291,6 +2399,11 @@ mod tests {
         let provides = run(RPM, &["-qp", "--provides", rpm.to_str().unwrap()], None).unwrap();
         assert!(provides.ok);
         assert!(provides.stdout.contains("libnativeprobe.so"));
+        assert!(
+            !provides.stdout.contains("libmuslsoprobe.so"),
+            "{}",
+            provides.stdout
+        );
         assert!(
             !provides.stdout.contains("libforeignprob.so"),
             "{}",
