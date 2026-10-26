@@ -1,6 +1,6 @@
 [package]
 name = "deb2rpm"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Convert a .deb to an .rpm with alien, fix what alien gets wrong, and install it with dnf"
 
