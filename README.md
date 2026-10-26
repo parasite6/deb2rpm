@@ -1,38 +1,74 @@
 # deb2rpm
 
-Convert a compatible Debian `.deb` package into an RPM and install it on Fedora. `deb2rpm` uses `alien` to prepare the package, repairs parts of the generated RPM spec, builds as your normal user with `fakeroot`, and uses `dnf` with `sudo` for installation.
+Convert a compatible Debian `.deb` package into an RPM and install it on Fedora. Uses `alien`, builds with `fakeroot`, installs via `dnf`.
 
-Written in Rust with no other Rust dependencies.
+## Contents
+
+- [Quickstart](#quickstart)
+- [Cheat sheet](#cheat-sheet)
+- [Requirements](#requirements)
+- [Build and install](#build-and-install)
+- [Usage](#usage)
+- [Conversion behavior](#conversion-behavior)
+- [Work files and troubleshooting](#work-files-and-troubleshooting)
+- [Development](#development)
+
+## Quickstart
+
+```sh
+# Install dependencies (Fedora)
+sudo dnf install alien fakeroot dpkg rpm-build glib2 binutils
+
+# Build and install deb2rpm
+bash install.sh
+
+# Convert and install a .deb
+deb2rpm app.deb
+
+# Build RPM only (no install)
+deb2rpm -n app.deb
+```
+
+## Cheat sheet
+
+| Option | Behavior |
+| --- | --- |
+| `-n`, `--build-only` | Build RPM, don't install |
+| `-o`, `--output DIR` | Save RPM copy to `DIR` |
+| `-y`, `--yes` | Skip `dnf` confirmation |
+| `--allow-downgrade` | Allow newer version replacement |
+| `--no-scripts` | Skip maintainer scripts |
+| `--force-arch` | Override architecture checks |
+| `--keep-work` | Keep temp build directory |
+| `--delete-work` | Delete work instead of Trash |
+| `--pause` | Wait for Enter before exit |
+| `-h`, `--help` | Show usage |
+
+Run as normal user (not `sudo`). Only one `.deb` per invocation.
 
 ## Requirements
 
-- Linux with Rust and Cargo to build the tool.
-- `alien`, `fakeroot`, `dpkg-deb`, `rpm`, and `rpmbuild` for conversion.
-- `dnf` and `sudo` for installation. (Should already be installed)
-- `gio` for the default move-to-Trash cleanup. (Should already be installed)
-- `readelf` and `ldconfig` for the advisory shared-library inspection.
+- Linux with Rust and Cargo to build.
+- `alien`, `fakeroot`, `dpkg-deb`, `rpm`, `rpmbuild`.
+- `dnf` and `sudo` for installation.
+- `gio` for Trash cleanup (default).
+- `readelf` and `ldconfig` for library inspection.
 
-On Fedora, the conversion tools are installed with:
+On Fedora:
 
 ```sh
 sudo dnf install alien fakeroot dpkg rpm-build glib2 binutils
 ```
 
-System tools are addressed by absolute paths under `/usr/bin` and `/usr/sbin`, so alternate versions earlier in `PATH` do not replace them.
-
 ## Build and install
-
-From the repository directory, run:
 
 ```sh
 bash install.sh
 ```
 
-The installer builds the release binary and installs it to `~/.local/bin/deb2rpm`. It also adds a desktop entry at `~/.local/share/applications/deb2rpm.desktop`, allowing a `.deb` file to be opened with **Convert & install (deb2rpm)** from a file manager. The desktop entry opens a terminal and waits for Enter before closing.
+Installs to `~/.local/bin/deb2rpm` and adds a desktop entry. `XDG_BIN_HOME` / `XDG_DATA_HOME` override locations. Ensure binary directory is in `PATH`.
 
-`XDG_BIN_HOME` and `XDG_DATA_HOME` override the binary and desktop-data locations. Ensure the binary directory is in your `PATH`.
-
-To build without installing the tool:
+To build without installing:
 
 ```sh
 cargo build --release
@@ -41,46 +77,23 @@ cargo build --release
 
 ## Usage
 
-Convert and install one package:
+Convert and install:
 
 ```sh
 deb2rpm app.deb
 ```
 
-Run as your normal user, not with `sudo`. The tool requests elevated privileges when installing and checking script status. `dnf` asks for confirmation unless `-y` is supplied.
-
-Build an RPM without installing it; by default, save it next to the input `.deb`:
+Build without installing:
 
 ```sh
 deb2rpm -n app.deb
-```
-
-Choose an output directory:
-
-```sh
 deb2rpm -n -o ./rpms app.deb
-```
-
-Install and keep a separate copy of the RPM:
-
-```sh
 deb2rpm -o ./rpms app.deb
 ```
 
-| Option | Behavior |
-| --- | --- |
-| `-n`, `--build-only` | Build and save the RPM without installing it. |
-| `-o`, `--output DIR` | Save a copy of the RPM in `DIR`. |
-| `-y`, `--yes` | Skip the `dnf` transaction confirmation; sudo authentication may still be required. |
-| `--allow-downgrade` | Permit replacing an installed newer version. |
-| `--no-scripts` | Omit the Debian package's maintainer scripts. |
-| `--force-arch` | Override architecture checks; this does not translate binaries for another CPU. |
-| `--keep-work` | Keep the temporary build directory. |
-| `--delete-work` | Delete successful or interrupted work instead of moving it to the Trash. |
-| `--pause` | Wait for Enter before exiting, useful for file-manager launches. |
-| `-h`, `--help` | Show usage. |
+Options table above in [Cheat sheet](#cheat-sheet).
 
-Only one `.deb` is accepted per invocation. `--keep-work` and `--delete-work` cannot be combined. Use `--` before a filename that starts with a dash.
+Only one `.deb` is accepted per invocation. `--keep-work` and `--delete-work` cannot be combined. Use `--` before filenames starting with a dash.
 
 ## Conversion behavior
 
@@ -107,8 +120,6 @@ rpm -q PACKAGE_NAME
 ```
 
 ## Development
-
-Run the unit tests with:
 
 ```sh
 cargo test
