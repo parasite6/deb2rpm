@@ -1172,9 +1172,154 @@ fn script_guard(hook: &str, pkg: &str, version: &str) -> Option<String> {
     Some(g)
 }
 
+#[derive(Clone)]
+struct DependencyElf {
+    path: String,
+    identity: [u8; 4],
+    needed: Vec<String>,
+}
+
+// Only known Node prebuild layouts with an ELF-verified glibc counterpart are optional.
+// Keep dependencies for arbitrary foreign binaries and musl-only applications.
+fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
+    let (identity, platform) = match arch {
+        "x86_64" => ([2, 1, 62, 0], "linux-x64"),
+        "aarch64" => ([2, 1, 183, 0], "linux-arm64"),
+        _ => return Vec::new(),
+    };
+    let mut excluded = BTreeSet::new();
+    for elf in elfs {
+        if !elf.path.contains("/node_modules/") || !elf.path.ends_with(".node") {
+            continue;
+        }
+        let foreign = elf.identity != identity;
+        let musl = elf
+            .needed
+            .iter()
+            .any(|n| n.starts_with("libc.musl-") || n == "libc.so")
+            && (elf.path.contains("-musl/")
+                || elf.path.contains("-musl.")
+                || elf.path.ends_with(".musl.node"));
+        if !foreign && !musl {
+            continue;
+        }
+        let mut candidate = elf.path.clone();
+        if foreign {
+            let other = if platform == "linux-x64" {
+                "linux-arm64"
+            } else {
+                "linux-x64"
+            };
+            candidate = candidate
+                .replace(&format!("{other}/"), &format!("{platform}/"))
+                .replace(&format!("{other}-"), &format!("{platform}-"))
+                .replace(&format!("{other}."), &format!("{platform}."));
+        }
+        let candidates = if musl {
+            vec![
+                candidate
+                    .replace("-musl", "-gnu")
+                    .replace(".musl.node", ".node"),
+                candidate
+                    .replace("-musl", "-glibc")
+                    .replace(".musl.node", ".node"),
+            ]
+        } else {
+            vec![candidate]
+        };
+        if candidates.iter().any(|path| {
+            path != &elf.path
+                && elfs.iter().any(|native| {
+                    &native.path == path
+                        && native.identity == identity
+                        && native.needed.iter().any(|n| n == "libc.so.6")
+                        && !native
+                            .needed
+                            .iter()
+                            .any(|n| n.starts_with("libc.musl-") || n == "libc.so")
+                })
+        }) {
+            excluded.insert(elf.path.clone());
+        }
+    }
+    excluded.into_iter().collect()
+}
+
+fn prebuild_exclusions(tree: &Path, arch: &str) -> Res<Vec<String>> {
+    let mut elfs = Vec::new();
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                let relative = format!(
+                    "/{}",
+                    path.strip_prefix(tree)
+                        .map_err(|e| e.to_string())?
+                        .to_str()
+                        .ok_or("non-UTF-8 payload path")?
+                );
+                if !relative.contains("/node_modules/") || !relative.ends_with(".node") {
+                    continue;
+                }
+                let Some(identity) = elf_identity(&path) else {
+                    continue;
+                };
+                let out = run(
+                    READELF,
+                    &["-d", "-W", path.to_str().ok_or("non-UTF-8 ELF path")?],
+                    None,
+                )?;
+                if !out.ok {
+                    return Err(format!(
+                        "could not inspect prebuild {}: {}",
+                        path.display(),
+                        out.stderr
+                    ));
+                }
+                let needed = out
+                    .stdout
+                    .lines()
+                    .filter(|l| l.contains("(NEEDED)"))
+                    .filter_map(|l| l.split('[').nth(1)?.split(']').next().map(str::to_string))
+                    .collect();
+                elfs.push(DependencyElf {
+                    path: relative,
+                    identity,
+                    needed,
+                });
+            }
+        }
+    }
+    Ok(dependency_exclusions(&elfs, arch))
+}
+
+// RPM matches installed paths without the buildroot. Escape ERE and RPM syntax.
+fn dependency_exclude_regex(paths: &[String]) -> String {
+    let literals: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let mut out = String::new();
+            for c in path.chars() {
+                if ".[]{}()*+?^$|\\".contains(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            // --define consumes one backslash layer before the regex is used.
+            out.replace('\\', "\\\\").replace('%', "%%")
+        })
+        .collect();
+    format!("^({})$", literals.join("|"))
+}
+
 // --- rpmbuild ------------------------------------------------------------------------------------
 
-fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path) -> Res<PathBuf> {
+fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path, excluded: &[String]) -> Res<PathBuf> {
     let d = dir.to_str().ok_or("path isn't UTF-8")?;
     let s = spec.to_str().ok_or("path isn't UTF-8")?;
     let buildroot = format!("--buildroot={d}");
@@ -1184,30 +1329,41 @@ fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path) -> Res<PathBuf> {
     // No post-processing: Fedora's brp scripts strip binaries, byte-compile Python, rewrite shebangs and
     // add build-id links — the payload must stay byte-identical to the .deb. Multithreaded zstd -7
     // instead of single-threaded -19 (minutes faster on big Electron apps, slightly larger rpm).
-    let out = run(
-        FAKEROOT,
-        &[
-            RPMBUILD,
-            &buildroot,
-            "--define",
-            &topdir,
-            "--define",
-            "__spec_install_post %{nil}",
-            "--define",
-            "__os_install_post %{nil}",
-            "--define",
-            "debug_package %{nil}",
-            "--define",
-            "_build_id_links none",
-            "--define",
-            "_binary_payload w7T0.zstdio",
-            "-bb",
-            "--target",
-            arch,
-            s,
-        ],
-        Some(dir),
-    )?;
+    for path in excluded {
+        info(&format!(
+            "excluding optional incompatible prebuild from RPM requirements/provides: {path}"
+        ));
+    }
+    let mut dependency_args = Vec::new();
+    if !excluded.is_empty() {
+        let regex = dependency_exclude_regex(excluded);
+        dependency_args.push(format!("__requires_exclude_from {regex}"));
+        dependency_args.push(format!("__provides_exclude_from {regex}"));
+    }
+    let mut args = vec![
+        RPMBUILD,
+        &buildroot,
+        "--define",
+        &topdir,
+        "--define",
+        "__spec_install_post %{nil}",
+        "--define",
+        "__os_install_post %{nil}",
+        "--define",
+        "debug_package %{nil}",
+        "--define",
+        "_build_id_links none",
+        "--define",
+        "_binary_payload w7T0.zstdio",
+        "-bb",
+        "--target",
+        arch,
+        s,
+    ];
+    for definition in &dependency_args {
+        args.extend(["--define", definition]);
+    }
+    let out = run(FAKEROOT, &args, Some(dir))?;
     let wrote = out
         .stdout
         .lines()
@@ -1305,7 +1461,7 @@ fn elf_identity(path: &Path) -> Option<[u8; 4]> {
 }
 
 /// Advisory only: do not execute binaries or claim to prove complete loader compatibility.
-fn missing_libraries(tree: &Path) -> LibraryReport {
+fn missing_libraries(tree: &Path, excluded: &[String]) -> LibraryReport {
     let mut report = LibraryReport::default();
     let mut system: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     match run(LDCONFIG, &["-p"], None) {
@@ -1354,6 +1510,10 @@ fn missing_libraries(tree: &Path) -> LibraryReport {
     }
     let canonical_tree = fs::canonicalize(tree).unwrap_or_else(|_| tree.into());
     for elf in elfs {
+        let relative = format!("/{}", elf.strip_prefix(tree).unwrap_or(&elf).display());
+        if excluded.contains(&relative) {
+            continue;
+        }
         let Some(e) = elf.to_str() else {
             report.unverified.push("non-UTF-8 ELF path".into());
             continue;
@@ -1739,7 +1899,8 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
     ));
 
     // before building: rpmbuild may clean up its buildroot (the unpacked tree)
-    let missing = missing_libraries(&dir);
+    let excluded = prebuild_exclusions(&dir, arch)?;
+    let missing = missing_libraries(&dir, &excluded);
 
     step("Fixing alien's spec");
     let fix = fix_spec(&original, &deb.name, !opts.build_only)?;
@@ -1759,7 +1920,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
 
     step("Building the rpm");
     let t = Instant::now();
-    let rpm = rpmbuild(&dir, &spec_path, arch, work)?;
+    let rpm = rpmbuild(&dir, &spec_path, arch, work, &excluded)?;
     info(&format!(
         "{} in {:.0?}",
         rpm.file_name().unwrap_or_default().to_string_lossy(),
@@ -1943,6 +2104,211 @@ mod tests {
         fs::remove_dir_all(target).unwrap();
     }
 
+    fn addon(path: &str, machine: u8, needed: &[&str]) -> DependencyElf {
+        DependencyElf {
+            path: path.into(),
+            identity: [2, 1, machine, 0],
+            needed: needed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn mixed_architecture_prebuilds_exclude_only_foreign_alternative() {
+        let elfs = vec![
+            addon(
+                "/opt/app/node_modules/pty/prebuilds/linux-arm64/pty.node",
+                183,
+                &["libc.so.6"],
+            ),
+            addon(
+                "/opt/app/node_modules/pty/prebuilds/linux-x64/pty.node",
+                62,
+                &["libc.so.6"],
+            ),
+            addon("/opt/required-arm64/tool", 183, &["libc.so.6"]),
+        ];
+        assert_eq!(
+            dependency_exclusions(&elfs, "x86_64"),
+            vec![elfs[0].path.clone()]
+        );
+        assert_eq!(
+            dependency_exclusions(&elfs, "aarch64"),
+            vec![elfs[1].path.clone()]
+        );
+        assert!(dependency_exclusions(&elfs[..1], "x86_64").is_empty());
+        assert!(dependency_exclusions(&elfs, "noarch").is_empty());
+    }
+
+    #[test]
+    fn mixed_libc_prebuilds_keep_glibc_and_standalone_musl() {
+        for (musl, native, needed) in [
+            (
+                "watcher-linux-x64-musl/watcher.node",
+                "watcher-linux-x64-glibc/watcher.node",
+                "libc.musl-x86_64.so.1",
+            ),
+            (
+                "napi-linux-x64-musl/a.linux-x64-musl.node",
+                "napi-linux-x64-gnu/a.linux-x64-gnu.node",
+                "libc.so",
+            ),
+            (
+                "prebuilds/linux-x64/a.musl.node",
+                "prebuilds/linux-x64/a.node",
+                "libc.musl-x86_64.so.1",
+            ),
+        ] {
+            let elfs = vec![
+                addon(&format!("/opt/app/node_modules/{musl}"), 62, &[needed]),
+                addon(
+                    &format!("/opt/app/node_modules/{native}"),
+                    62,
+                    &["libc.so.6"],
+                ),
+            ];
+            assert_eq!(
+                dependency_exclusions(&elfs, "x86_64"),
+                vec![elfs[0].path.clone()]
+            );
+            assert!(dependency_exclusions(&elfs[..1], "x86_64").is_empty());
+            let mut wrong = elfs.clone();
+            wrong[1].identity[2] = 183;
+            assert!(dependency_exclusions(&wrong, "x86_64").is_empty());
+            wrong[1] = addon(&elfs[1].path, 62, &["libc.so"]);
+            assert!(dependency_exclusions(&wrong, "x86_64").is_empty());
+        }
+        // Neither a suggestive filename nor unversioned libc alone proves an optional musl addon.
+        let elfs = vec![
+            addon("/opt/libc.so", 62, &["libc.so"]),
+            addon("/opt/tool-musl.node", 62, &["libc.so"]),
+        ];
+        assert!(dependency_exclusions(&elfs, "x86_64").is_empty());
+    }
+
+    #[test]
+    fn dependency_regex_survives_rpm_expansion_as_literal_paths() {
+        let paths = vec!["/opt/app+(1)/node_modules/a[2]/50%{name}.node".into()];
+        let regex = dependency_exclude_regex(&paths);
+        let definition = format!("__requires_exclude_from {regex}");
+        let out = run(
+            RPM,
+            &[
+                "--define",
+                &definition,
+                "--eval",
+                "%{__requires_exclude_from}",
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(
+            out.stdout.trim(),
+            r"^(/opt/app\+\(1\)/node_modules/a\[2\]/50%\{name\}\.node)$"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn rpm_filters_mixed_prebuild_files_and_preserves_native_dependencies() {
+        let _guard = fork_lock_test_guard();
+        let work = temporary_dir("mixed-rpm");
+        let tree = work.join("payload");
+        let modules = tree.join("opt/app/node_modules");
+        let native = modules.join("pty/prebuilds/linux-x64/pty.node");
+        let foreign = modules.join("pty/prebuilds/linux-arm64/pty.node");
+        let glibc = modules.join("watcher-linux-x64-glibc/watcher.node");
+        let musl = modules.join("watcher-linux-x64-musl/watcher.node");
+        for p in [&native, &foreign, &glibc, &musl] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+        }
+        fs::write(
+            work.join("addon.c"),
+            b"extern int puts(const char *); int addon(void) { return puts(\"probe\"); }\n",
+        )
+        .unwrap();
+        assert!(Command::new("/usr/bin/gcc")
+            .args(["-shared", "-fPIC", "-Wl,-soname,libnativeprobe.so"])
+            .arg(work.join("addon.c"))
+            .arg("-o")
+            .arg(&native)
+            .status()
+            .unwrap()
+            .success());
+        fs::copy(&native, &glibc).unwrap();
+        let mut bytes = fs::read(&native).unwrap();
+        bytes[18] = 183; // a real dynamic ELF, with a foreign e_machine
+        let soname = b"libnativeprobe.so";
+        let offset = bytes
+            .windows(soname.len())
+            .position(|w| w == soname)
+            .unwrap();
+        bytes[offset..offset + soname.len()].copy_from_slice(b"libforeignprob.so");
+        fs::write(&foreign, bytes).unwrap();
+        fs::write(work.join("stub.c"), b"int probe(void) { return 0; }\n").unwrap();
+        let libc = work.join("libc.musl-x86_64.so.1");
+        assert!(Command::new("/usr/bin/gcc")
+            .args([
+                "-shared",
+                "-fPIC",
+                "-nostdlib",
+                "-Wl,-soname,libc.musl-x86_64.so.1"
+            ])
+            .arg(work.join("stub.c"))
+            .arg("-o")
+            .arg(&libc)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/gcc")
+            .args([
+                "-shared",
+                "-fPIC",
+                "-nostdlib",
+                "-Wl,--no-as-needed",
+                "-Wl,-soname,libmuslprobe.so"
+            ])
+            .arg(work.join("stub.c"))
+            .arg(&libc)
+            .arg("-o")
+            .arg(&musl)
+            .status()
+            .unwrap()
+            .success());
+        let excluded = prebuild_exclusions(&tree, "x86_64").unwrap();
+        assert_eq!(excluded.len(), 2);
+        let spec = work.join("probe.spec");
+        fs::write(&spec, "Name: mixedprobe\nVersion: 1\nRelease: 1\nSummary: mixed ELF test\nLicense: MIT\n%description\nTest\n%files\n%defattr(-,root,root,-)\n/opt/app\n").unwrap();
+        let rpm = rpmbuild(&tree, &spec, "x86_64", &work, &excluded).unwrap();
+        let requirements = run(RPM, &["-qp", "--requires", rpm.to_str().unwrap()], None).unwrap();
+        assert!(requirements.ok);
+        assert!(requirements.stdout.contains("libc.so.6(GLIBC_"));
+        assert!(
+            !requirements.stdout.contains("musl"),
+            "{}",
+            requirements.stdout
+        );
+        let provides = run(RPM, &["-qp", "--provides", rpm.to_str().unwrap()], None).unwrap();
+        assert!(provides.ok);
+        assert!(provides.stdout.contains("libnativeprobe.so"));
+        assert!(
+            !provides.stdout.contains("libforeignprob.so"),
+            "{}",
+            provides.stdout
+        );
+        assert!(
+            !provides.stdout.contains("libmuslprobe.so"),
+            "{}",
+            provides.stdout
+        );
+        // RPM keeps the excluded files in the payload.
+        let files = run(RPM, &["-qpl", rpm.to_str().unwrap()], None).unwrap();
+        for path in excluded {
+            assert!(files.stdout.contains(&path));
+        }
+        fs::remove_dir_all(work).unwrap();
+    }
+
     #[test]
     fn spec_keeps_automatic_dependencies() {
         let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n\n%files\n\"/opt/demo\"\n";
@@ -1998,12 +2364,7 @@ mod tests {
     #[test]
     fn sanitize_spec_rejects_leading_percent_in_description() {
         for injected in [
-            "%prep",
-            "  %prep",
-            "\t%build",
-            "%PREP",
-            "%files",
-            "%install",
+            "%prep", "  %prep", "\t%build", "%PREP", "%files", "%install",
         ] {
             let spec = alienish_spec(&format!("{injected}\ntouch marker\n"), &[]);
             let err = sanitize_spec(&spec, "demo").unwrap_err().to_string();
@@ -2018,12 +2379,7 @@ mod tests {
     fn sanitize_spec_rejects_leading_percent_in_each_scriptlet() {
         for hook in ["%pre", "%post", "%preun", "%postun"] {
             for injected in [
-                "%prep",
-                "  %prep",
-                "\t%build",
-                "%PREP",
-                "%files",
-                "%install",
+                "%prep", "  %prep", "\t%build", "%PREP", "%files", "%install",
             ] {
                 // Alien doubles % in script bodies; both raw and doubled forms
                 // begin with '%' after whitespace strip and must be rejected.
@@ -2051,10 +2407,7 @@ mod tests {
         let clean = sanitize_spec(&spec, "demo").unwrap();
         assert!(clean.contains("100%% done"));
         assert!(clean.contains("a %%%% b"));
-        let with_scripts = alienish_spec(
-            "Demo\n",
-            &[("%pre", "#!/bin/sh\necho 100%% done\n")],
-        );
+        let with_scripts = alienish_spec("Demo\n", &[("%pre", "#!/bin/sh\necho 100%% done\n")]);
         let clean = sanitize_spec(&with_scripts, "demo").unwrap();
         // Alien-style %% in the script is normalized then re-doubled to %%.
         assert!(clean.contains("100%% done"));
@@ -2124,12 +2477,11 @@ mod tests {
                 "expected rejection for {key} value split by \\n%prep"
             );
         }
-        let files_inject = alienish_spec("Demo\n", &[]).replacen(
-            "\"/opt/demo\"\n",
-            "\"/opt/demo\n%prep\"\n",
-            1,
-        );
-        let err = sanitize_spec(&files_inject, "demo").unwrap_err().to_string();
+        let files_inject =
+            alienish_spec("Demo\n", &[]).replacen("\"/opt/demo\"\n", "\"/opt/demo\n%prep\"\n", 1);
+        let err = sanitize_spec(&files_inject, "demo")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("filename") || err.contains("file"),
             "expected %files path rejection for embedded \\n%prep, got {err}"
@@ -2191,7 +2543,10 @@ mod tests {
         let spec_path = topdir.join("SPECS/demo.spec");
         fs::write(&spec_path, &spec).unwrap();
         let rpmbuild = Path::new(RPMBUILD);
-        assert!(rpmbuild.exists(), "rpmbuild required for ignored P1 control");
+        assert!(
+            rpmbuild.exists(),
+            "rpmbuild required for ignored P1 control"
+        );
         let out = Command::new(rpmbuild)
             .args([
                 "-bp",
@@ -2313,13 +2668,13 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(!missing_libraries(&d)
+        assert!(!missing_libraries(&d, &[])
             .missing
             .iter()
             .any(|(lib, _)| lib == "libauditprobe.so.1"));
         fs::remove_file(d.join("libauditprobe.so.1")).unwrap();
         fs::write(d.join("libauditprobe.so.1"), b"not an ELF library").unwrap();
-        assert!(missing_libraries(&d)
+        assert!(missing_libraries(&d, &[])
             .missing
             .iter()
             .any(|(lib, _)| lib == "libauditprobe.so.1"));
@@ -2545,7 +2900,11 @@ mod tests {
         (home, xdg, tmp)
     }
 
-    fn build_hostile_deb(staging: &Path, description_attack: bool, postinst_attack: bool) -> PathBuf {
+    fn build_hostile_deb(
+        staging: &Path,
+        description_attack: bool,
+        postinst_attack: bool,
+    ) -> PathBuf {
         let root = staging.join("tree");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("DEBIAN")).unwrap();

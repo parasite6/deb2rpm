@@ -87,7 +87,7 @@ Only one `.deb` is accepted per invocation. `--keep-work` and `--delete-work` ca
 - Repairs empty RPM summaries and sets packaged file ownership to `root:root`.
 - When preparing an installation, removes shared directory ownership claims that conflict with other installed RPMs. Build-only mode retains directory entries except `/`.
 - Adapts Debian maintainer-script arguments for installation, upgrades, and removal, and replaces alien's predictable script temporary directory with a private one.
-- Preserves automatic RPM requirements and provides so `dnf` can resolve the transaction.
+- Preserves automatic RPM requirements and provides so `dnf` can resolve the transaction. For x86_64 and aarch64 packages, known Node addon prebuild layouts are checked for bundled alternatives: an incompatible architecture or musl variant is excluded from dependency scanning only when a matching target-architecture glibc ELF is present. The files remain in the RPM; standalone musl binaries and unrecognized layouts keep their dependencies. Each exclusion is logged and also applies to the advisory library scan.
 - Checks for files owned by other packages before installation and blocks downgrades unless explicitly allowed.
 - Uses reinstall behavior when the built version matches the installed version.
 - Inspects ELF library requirements without executing the packaged binaries. This inspection is advisory.
