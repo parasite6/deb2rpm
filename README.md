@@ -2,7 +2,7 @@
 
 > Convert Debian `.deb` packages → Fedora `.rpm` and install with `dnf`. No root build; user-space conversion with `fakeroot`.
 
-📋 [Tree](#-contents) · 🚀 [Quickstart](#-quickstart) · 🧾 [Cheat Sheet](#-cheat-sheet) · 📖 [Usage](#-usage) · 🔧 [Conversion Details](#-conversion-behavior) · 🐛 [Audit / Issues](#-audit-findings) · 📚 [Development](#-development)
+[Tree](#-contents) · [Quickstart](#-quickstart) · [Cheat Sheet](#-cheat-sheet) · [Usage](#-usage) · [Conversion Details](#-conversion-behavior) · [Audit / Issues](#-audit-findings) · [Development](#-development)
 
 ---
 
