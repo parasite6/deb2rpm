@@ -4,4 +4,3 @@ build/
 dist/
 audit*
 !audit.md
-test*
