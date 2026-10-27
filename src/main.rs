@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -31,6 +31,11 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod close_prompt;
+mod interactive_output;
+mod progress;
+use progress::Stage;
 
 // System tools by absolute path: ~/.linuxbrew/bin shadows some of them (gio, …) on this machine.
 const ALIEN: &str = "/usr/bin/alien";
@@ -232,8 +237,11 @@ struct Log {
 
 impl Log {
     fn write(&mut self, text: &str) {
+        self.write_bytes(text.as_bytes());
+    }
+    fn write_bytes(&mut self, bytes: &[u8]) {
         if let Some(f) = self.file.as_mut() {
-            if let Err(e) = f.write_all(text.as_bytes()) {
+            if let Err(e) = f.write_all(bytes) {
                 err_out(&format!("warning: log write failed: {e}\n"));
                 self.file = None;
             }
@@ -256,22 +264,28 @@ fn out(text: &str) {
 }
 
 fn err_out(text: &str) {
+    progress::suspend();
     let _ = io::stderr().write_all(text.as_bytes());
 }
 
-fn step(msg: &str) {
-    out(&format!("\x1b[1m==> {msg}\x1b[0m\n"));
+fn step(stage: Stage, msg: &str) {
+    if !progress::step(stage, msg) {
+        out(&format!("==> {msg}\n"));
+    }
     log(&format!("\n==> {msg}\n"));
 }
 
 fn info(msg: &str) {
-    out(&format!("    {msg}\n"));
     log(&format!("    {msg}\n"));
+    if !progress::info(msg) {
+        out(&format!("    {msg}\n"));
+    }
 }
 
 fn warn(msg: &str) {
-    err_out(&format!("    \x1b[33mwarning:\x1b[0m {msg}\n"));
+    err_out(&format!("    \x1b[38;2;164;101;76mwarning:\x1b[0m {msg}\n"));
     log(&format!("    warning: {msg}\n"));
+    progress::resume();
 }
 
 // --- running commands ----------------------------------------------------------------------------
@@ -343,6 +357,7 @@ fn run(prog: &str, args: &[&str], cwd: Option<&Path>) -> Res<Out> {
                 "command exited but descendants kept its output pipes open".into()
             });
         }
+        progress::tick();
         std::thread::sleep(Duration::from_millis(30));
     }
     // Keep the leader unreaped until the last group signal, pinning its PID/PGID
@@ -445,9 +460,14 @@ fn drain_pipe(pipe: &mut impl Read, output: &mut Vec<u8>) -> io::Result<bool> {
     Ok(false)
 }
 
-fn wait_child(child: &mut std::process::Child, group: bool) -> Res<std::process::ExitStatus> {
+fn wait_child(
+    child: &mut std::process::Child,
+    group: bool,
+    mut pump: impl FnMut(),
+) -> Res<std::process::ExitStatus> {
     let mut signalled = None;
     loop {
+        pump();
         if interrupted() && signalled.is_none() {
             let target = if group {
                 -(child.id() as i32)
@@ -468,9 +488,31 @@ fn wait_child(child: &mut std::process::Child, group: bool) -> Res<std::process:
             .try_wait()
             .map_err(|e| format!("waiting for child: {e}"))?
         {
+            pump();
             return Ok(st);
         }
         std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn relay_interactive(stream: &mut impl Read, stderr: bool, pty: bool, errors: &mut Vec<String>) {
+    let mut bytes = Vec::new();
+    if let Err(e) = drain_pipe(stream, &mut bytes) {
+        // Linux PTY masters report EIO when the last slave is closed: normal EOF.
+        if !(pty && e.raw_os_error() == Some(5)) && errors.is_empty() {
+            errors.push(format!("interactive output: {e}"));
+        }
+    }
+    if !bytes.is_empty() {
+        if stderr {
+            let _ = io::stderr().write_all(&bytes);
+        } else {
+            let _ = io::stdout().write_all(&bytes);
+            let _ = io::stdout().flush();
+        }
+        if let Ok(mut log) = LOG.lock() {
+            log.write_bytes(&bytes);
+        }
     }
 }
 
@@ -480,13 +522,38 @@ fn run_interactive(prog: &str, args: &[&str]) -> Res<bool> {
     if interrupted() {
         return Err(STOPPED.into());
     }
+    // Configure nonblocking readers before spawning: setup failure cannot leave
+    // a privileged installer running without supervision. Stdin remains the real
+    // terminal; no input or passwords are captured. Only stdout/stderr are logged.
+    let (mut output, stdout_writer, stderr_writer) =
+        interactive_output::prepare().map_err(|e| e.to_string())?;
+    let _screen = progress::InteractiveScreen::enter();
     let mut child = Command::new(prog)
         .args(args)
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
         .spawn()
         .map_err(|e| format!("can't run {prog}: {e}"))?;
-    let st = wait_child(&mut child, false)?;
+    let mut errors = Vec::new();
+    let st = wait_child(&mut child, false, || match &mut output {
+        interactive_output::Output::Terminal(pty) => {
+            if let Err(e) = pty.refresh_size() {
+                if errors.is_empty() {
+                    errors.push(format!("terminal resize: {e}"));
+                }
+            }
+            relay_interactive(&mut pty.master, false, true, &mut errors);
+        }
+        interactive_output::Output::Pipes(stdout, stderr) => {
+            relay_interactive(stdout, false, false, &mut errors);
+            relay_interactive(stderr, true, false, &mut errors);
+        }
+    })?;
     if interrupted() {
         return Err(STOPPED.into());
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
     Ok(st.success())
 }
@@ -725,7 +792,7 @@ fn alien_generate(deb: &Path, work: &Path, scripts: bool) -> Res<PathBuf> {
     if let Some(dir) = try_alien(deb)? {
         return Ok(dir);
     }
-    step("Repacking the .deb so alien can read it");
+    step(Stage::Repacking, "Repacking the .deb so alien can read it");
     let raw = work.join("repack");
     let w = |p: &Path| {
         p.to_str()
@@ -808,26 +875,111 @@ struct SpecFix {
     scriptlets: Vec<String>,
 }
 
-/// Who owns `path` according to the rpm database (several packages can own one directory).
-/// None = the query itself failed; Some(empty) = exists but unowned.
-fn owners(path: &str) -> Option<Vec<String>> {
-    static OWNERS: OnceLock<Option<BTreeMap<String, Vec<String>>>> = OnceLock::new();
-    let map = OWNERS
-        .get_or_init(|| {
-            let out = run(RPM, &["-qa", "--qf", "[%{FILENAMES}\t%{=NAME}\n]"], None).ok()?;
-            if !out.ok {
+type Ownership = BTreeMap<String, Vec<String>>;
+static OWNERS: OnceLock<Mutex<BTreeMap<String, Option<Vec<String>>>>> = OnceLock::new();
+
+fn rpm_ownership_query(args: &[&str]) -> Option<Out> {
+    let mut command = vec!["LC_ALL=C", RPM];
+    command.extend_from_slice(args);
+    run("/usr/bin/env", &command, None).ok()
+}
+
+fn owner_packages(paths: &[String], out: &Out) -> Option<BTreeSet<String>> {
+    if !out.stderr.is_empty() {
+        return None;
+    }
+    let mut packages = BTreeSet::new();
+    let mut unowned = false;
+    for line in out.stdout.lines() {
+        if let Some(name) = line.strip_prefix("OWNER\t") {
+            if name.is_empty() || name.chars().any(char::is_control) {
                 return None;
             }
-            let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for line in out.stdout.lines() {
-                if let Some((p, name)) = line.split_once('\t') {
-                    map.entry(p.into()).or_default().push(name.into());
-                }
+            packages.insert(name.to_string());
+        } else if paths
+            .iter()
+            .any(|p| line == format!("file {p} is not owned by any package"))
+        {
+            unowned = true;
+        } else {
+            return None;
+        }
+    }
+    if !out.ok && !(out.code == Some(1) && unowned) {
+        return None;
+    }
+    if out.ok && packages.is_empty() {
+        return None;
+    }
+    if out.ok && unowned {
+        return None;
+    }
+    Some(packages)
+}
+
+/// Use RPM's file index to select candidate packages, then verify literal file
+/// ownership in their headers. Virtual provides and symlink targets are never
+/// mistaken for ownership of the requested path. Any query/parse failure is None.
+fn query_owners(paths: &[String]) -> Option<Ownership> {
+    let mut map: Ownership = paths.iter().map(|p| (p.clone(), Vec::new())).collect();
+    if paths.is_empty() {
+        return Some(map);
+    }
+    let mut args = vec!["-q", "--whatprovides", "--qf", "OWNER\t%{NAME}\n", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let packages = owner_packages(paths, &rpm_ownership_query(&args)?)?;
+    if packages.is_empty() {
+        return Some(map);
+    }
+    let mut args = vec!["-q", "--qf", "[%{FILENAMES}\t%{=NAME}\n]", "--"];
+    args.extend(packages.iter().map(String::as_str));
+    let out = rpm_ownership_query(&args)?;
+    if !out.ok || !out.stderr.is_empty() {
+        return None;
+    }
+    for line in out.stdout.lines() {
+        let (path, name) = line.rsplit_once('\t')?;
+        if !packages.contains(name) || !path.starts_with('/') {
+            return None;
+        }
+        if let Some(owners) = map.get_mut(path) {
+            if !owners.iter().any(|n| n == name) {
+                owners.push(name.into());
             }
-            Some(map)
-        })
-        .as_ref()?;
-    Some(map.get(path).cloned().unwrap_or_default())
+        }
+    }
+    Some(map)
+}
+
+fn cache_owners(paths: &[String]) {
+    let cache = OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let missing: BTreeSet<String> = match cache.lock() {
+        Ok(cache) => paths
+            .iter()
+            .filter(|p| !cache.contains_key(*p))
+            .cloned()
+            .collect(),
+        Err(_) => return,
+    };
+    let missing: Vec<_> = missing.into_iter().collect();
+    // Bound argv size, including unusually long package-controlled filenames.
+    for chunk in missing.chunks(64) {
+        let result = query_owners(chunk);
+        if let Ok(mut cache) = cache.lock() {
+            for path in chunk {
+                cache.insert(
+                    path.clone(),
+                    result.as_ref().and_then(|map| map.get(path).cloned()),
+                );
+            }
+        }
+    }
+}
+
+/// None = query failure; Some(empty) = verified unowned. Never conflate the two.
+fn owners(path: &str) -> Option<Vec<String>> {
+    cache_owners(&[path.to_string()]);
+    OWNERS.get()?.lock().ok()?.get(path).cloned().flatten()
 }
 
 // Accept alien's generated layout, not arbitrary RPM programs. In particular,
@@ -1014,9 +1166,97 @@ fn spec_version(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || ".+:~_-".contains(c))
 }
 
-fn fix_spec(text: &str, pkg: &str, installing: bool) -> Res<SpecFix> {
+// A bare directory in %files recursively claims its contents. Expand it into
+// explicit entries before filtering, so dropping a shared parent never drops
+// payload files or lets a recursive parent reintroduce a filtered directory.
+fn explicit_file_directories(text: &str, tree: &Path) -> Res<String> {
+    let (header, files) = text.split_once("\n%files\n").ok_or("missing %files")?;
+    let entry_path = |line: &str| {
+        unquote(
+            line.strip_prefix("%dir ")
+                .or_else(|| line.strip_prefix("%config "))
+                .unwrap_or(line),
+        )
+        .replace("%%", "%")
+    };
+    let mut listed: HashSet<String> = files
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(entry_path)
+        .collect();
+    let mut out = format!("{header}\n%files\n");
+    let mut stack = Vec::new();
+    for line in files.lines() {
+        let path = entry_path(line);
+        let source = tree.join(path.trim_start_matches('/'));
+        if line.starts_with('"') && source.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            let _ = writeln!(out, "%dir {line}");
+            stack.push(source);
+        } else {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    let mut visited = HashSet::new();
+    let canonical_tree = fs::canonicalize(tree).ok();
+    while let Some(dir) = stack.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let canonical = fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        if !canonical_tree
+            .as_ref()
+            .is_some_and(|root| canonical.starts_with(root))
+        {
+            return Err(format!(
+                "payload directory escapes buildroot: {}",
+                dir.display()
+            ));
+        }
+        let mut entries = fs::read_dir(&dir)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let source = entry.path();
+            let is_dir = entry.file_type().map_err(|e| e.to_string())?.is_dir();
+            if is_dir {
+                stack.push(source.clone());
+            }
+            let relative = source
+                .strip_prefix(tree)
+                .map_err(|e| e.to_string())?
+                .to_str()
+                .ok_or("non-UTF-8 payload path")?;
+            if relative.contains(['"', '\\']) || relative.chars().any(char::is_control) {
+                return Err("unsafe filename in payload directory".into());
+            }
+            let path = format!("/{relative}");
+            if listed.insert(path.clone()) {
+                let directive = if is_dir { "%dir " } else { "" };
+                let _ = writeln!(out, "{directive}\"{}\"", path.replace('%', "%%"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn fix_spec(text: &str, pkg: &str, installing: bool, tree: &Path) -> Res<SpecFix> {
     let sanitized = sanitize_spec(text, pkg)?;
-    let text = sanitized.as_str();
+    let explicit = explicit_file_directories(&sanitized, tree)?;
+    if installing {
+        let paths = explicit
+            .split_once("\n%files\n")
+            .ok_or("missing %files")?
+            .1
+            .lines()
+            .filter_map(|line| line.strip_prefix("%dir "))
+            .map(|path| unquote(path).replace("%%", "%"))
+            .filter(|path| path != "/" && Path::new(path).exists())
+            .collect::<Vec<_>>();
+        cache_owners(&paths);
+    }
+    let text = explicit.as_str();
     let mut out = String::with_capacity(text.len() + 1024);
     let mut dropped = Vec::new();
     let mut kept = 0usize;
@@ -1110,7 +1350,7 @@ fn fix_spec(text: &str, pkg: &str, installing: bool) -> Res<SpecFix> {
         }
 
         if in_files && head == "%dir" {
-            let path = unquote(trimmed["%dir".len()..].trim());
+            let path = unquote(trimmed["%dir".len()..].trim()).replace("%%", "%");
             let drop = if !installing || !Path::new(&path).exists() {
                 false // only this package will create it
             } else {
@@ -1434,6 +1674,16 @@ fn conflicts(rpm: &str, pkg: &str) -> Res<Vec<String>> {
     if !list.ok {
         return Err(format!("can't inspect RPM files: {}", list.stderr));
     }
+    let existing = list
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(path, perms)| {
+            !perms.starts_with('d') && Path::new(path).symlink_metadata().is_ok()
+        })
+        .map(|(path, _)| path.to_string())
+        .collect::<Vec<_>>();
+    cache_owners(&existing);
     let mut out = Vec::new();
     for line in list.stdout.lines() {
         let Some((path, perms)) = line.split_once('\t') else {
@@ -1680,10 +1930,13 @@ fn main() -> ExitCode {
         }
     };
     let pause = opts.pause;
-    let code = match convert(opts) {
+    progress::start(opts.build_only);
+    let result = convert(opts);
+    progress::finish(result.is_ok(), interrupted());
+    let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if interrupted() => {
-            err_out(&format!("\n\x1b[33m{e}\x1b[0m\n"));
+            err_out(&format!("\n\x1b[38;2;60;115;135m{e}\x1b[0m\n"));
             ExitCode::from(130)
         }
         Err(e) => {
@@ -1693,8 +1946,10 @@ fn main() -> ExitCode {
         }
     };
     if pause && !interrupted() {
-        out("\nPress Enter to close… ");
         if let Err(e) = wait_for_enter() {
+            if interrupted() {
+                return ExitCode::from(130);
+            }
             err_out(&format!("\nerror waiting for input: {e}\n"));
             return ExitCode::FAILURE;
         }
@@ -1707,8 +1962,11 @@ fn main() -> ExitCode {
 }
 
 fn wait_for_enter() -> io::Result<()> {
+    let _terminal = close_prompt::Terminal::new()?;
+    out("\nPress Enter to close… ");
     let stdin = io::stdin();
     let mut input = stdin.lock();
+    let mut keys = close_prompt::Input::default();
     let mut fd = PollFd {
         fd: input.as_raw_fd(),
         events: 1, /* POLLIN */
@@ -1726,9 +1984,16 @@ fn wait_for_enter() -> io::Result<()> {
             return Err(e);
         }
         if ready > 0 && !interrupted() {
-            let mut byte = [0];
-            if input.read(&mut byte)? == 0 || byte[0] == b'\n' {
-                break;
+            let mut bytes = [0; 4096];
+            match input.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if bytes[..count].iter().any(|byte| keys.feed(*byte)) {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1743,6 +2008,9 @@ fn convert(opts: Opts) -> Res<()> {
     if !opts.build_only {
         tools.extend([DNF, SUDO]);
     }
+    if opts.pause && io::stdin().is_terminal() {
+        tools.push("/usr/bin/stty");
+    }
     if !opts.keep_work && !opts.delete_work {
         tools.push(GIO);
     }
@@ -1754,6 +2022,7 @@ fn convert(opts: Opts) -> Res<()> {
                 DPKG_DEB => "dpkg",
                 RPMBUILD => "rpm-build",
                 GIO => "glib2",
+                "/usr/bin/stty" => "coreutils",
                 _ => "",
             };
             return Err(format!(
@@ -1790,7 +2059,7 @@ fn convert(opts: Opts) -> Res<()> {
         }
     }
 
-    step("Reading the .deb");
+    step(Stage::Reading, "Reading the .deb");
     let deb = read_deb(&opts.deb)?;
     info(&format!("{} {} ({})", deb.name, deb.version, deb.arch));
 
@@ -1870,8 +2139,8 @@ fn convert(opts: Opts) -> Res<()> {
             };
             return Err(format!("{what} {files}"));
         }
-        Err(_) => err_out(&format!(
-            "\n    work dir and full log kept for inspection: {}\n",
+        Err(_) => info(&format!(
+            "work dir and full log kept for inspection: {}",
             log_path.display()
         )),
     }
@@ -1908,7 +2177,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
         ));
     }
 
-    step("Unpacking with alien");
+    step(Stage::Unpacking, "Unpacking with alien");
     let t = Instant::now();
     let dir = alien_generate(&deb.path, work, !opts.no_scripts)?;
     let spec_path = find_spec(&dir)?;
@@ -1927,8 +2196,8 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
     let excluded = prebuild_exclusions(&dir, arch)?;
     let missing = missing_libraries(&dir, &excluded);
 
-    step("Fixing alien's spec");
-    let fix = fix_spec(&original, &deb.name, !opts.build_only)?;
+    step(Stage::Fixing, "Fixing alien's spec");
+    let fix = fix_spec(&original, &deb.name, !opts.build_only, &dir)?;
     for d in &fix.dropped_dirs {
         info(&format!("not claiming shared directory {d}"));
     }
@@ -1943,7 +2212,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
     }
     fs::write(&spec_path, &fix.text).map_err(|e| format!("can't write the spec: {e}"))?;
 
-    step("Building the rpm");
+    step(Stage::Building, "Building the rpm");
     let t = Instant::now();
     let rpm = rpmbuild(&dir, &spec_path, arch, work, &excluded)?;
     info(&format!(
@@ -1952,7 +2221,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
         t.elapsed()
     ));
 
-    step("Checking the rpm");
+    step(Stage::Checking, "Checking the rpm");
     let rpm_s = rpm.to_str().ok_or("path isn't UTF-8")?.to_string();
     if missing.missing.is_empty() && missing.unverified.is_empty() {
         info(
@@ -2017,9 +2286,10 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
         }
         None => "install",
     };
-    step(&format!(
-        "Installing ({verb}) — dnf will ask for your password"
-    ));
+    step(
+        Stage::Installing,
+        &format!("Installing ({verb}) — dnf will ask for your password"),
+    );
     let mut args = vec![DNF, verb];
     if opts.yes {
         args.push("-y");
@@ -2056,7 +2326,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
             ));
         }
     }
-    step(&format!("Done — {name} {built} is installed"));
+    step(Stage::Done, &format!("Done — {name} {built} is installed"));
     Ok(())
 }
 
@@ -2423,9 +2693,132 @@ mod tests {
     }
 
     #[test]
+    fn ownership_query_errors_are_not_treated_as_unowned() {
+        let paths = vec!["/tmp/unowned".into()];
+        let unowned = Out {
+            ok: false,
+            code: Some(1),
+            stdout: "file /tmp/unowned is not owned by any package\n".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(owner_packages(&paths, &unowned), Some(BTreeSet::new()));
+        for (code, stdout, stderr) in [
+            (1, "", "database error"),
+            (1, "OWNER\tfilesystem\n", ""),
+            (2, "file /tmp/unowned is not owned by any package\n", ""),
+            (1, "unrecognized failure\n", ""),
+        ] {
+            let out = Out {
+                ok: false,
+                code: Some(code),
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+            };
+            assert!(owner_packages(&paths, &out).is_none());
+        }
+    }
+
+    #[test]
+    fn indexed_ownership_matches_full_rpm_snapshot_including_multiple_owners() {
+        let _guard = fork_lock_test_guard();
+        let temp = temporary_dir("ownership");
+        let unowned = temp.join("unowned");
+        fs::write(&unowned, b"probe").unwrap();
+        let paths = vec![
+            "/usr".into(),
+            "/usr/bin".into(),
+            "/usr/lib".into(),
+            "/bin".into(),
+            "/usr/bin/sh".into(),
+            "/usr/share/icons/hicolor".into(),
+            unowned.to_str().unwrap().into(),
+        ];
+        let indexed = query_owners(&paths).expect("indexed RPM lookup must succeed");
+        let all = Command::new(RPM)
+            .args(["-qa", "--qf", "[%{FILENAMES}\t%{=NAME}\n]"])
+            .output()
+            .unwrap();
+        assert!(all.status.success());
+        let mut reference: BTreeMap<String, BTreeSet<String>> =
+            paths.iter().map(|p| (p.clone(), BTreeSet::new())).collect();
+        for line in String::from_utf8(all.stdout).unwrap().lines() {
+            if let Some((path, name)) = line.rsplit_once('\t') {
+                if let Some(owners) = reference.get_mut(path) {
+                    owners.insert(name.into());
+                }
+            }
+        }
+        for path in paths {
+            assert_eq!(
+                indexed[&path].iter().cloned().collect::<BTreeSet<_>>(),
+                reference[&path],
+                "{path}"
+            );
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn bare_directories_are_filtered_without_losing_recursive_payload() {
+        let _guard = fork_lock_test_guard();
+        let tree = temporary_dir("bare-dirs");
+        for dir in ["usr/bin", "usr/lib/Ollaya/lib", "usr/share/ollaya"] {
+            fs::create_dir_all(tree.join(dir)).unwrap();
+        }
+        fs::write(tree.join("usr/bin/ollaya"), b"app").unwrap();
+        fs::write(tree.join("usr/lib/Ollaya/lib/data"), b"data").unwrap();
+        fs::write(tree.join("usr/share/ollaya/50%data"), b"data").unwrap();
+        std::os::unix::fs::symlink("Ollaya", tree.join("usr/lib/alias")).unwrap();
+        let spec = "Name: demo\nVersion: 1\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n%files\n\"/usr\"\n%config \"/usr/share/ollaya/50%data\"\n";
+        let fixed = fix_spec(spec, "demo", true, &tree).unwrap();
+        for dir in ["/usr", "/usr/bin", "/usr/lib"] {
+            assert!(fixed.dropped_dirs.contains(&dir.to_string()), "{dir}");
+            assert!(!fixed.text.lines().any(|l| l == format!("%dir \"{dir}\"")));
+        }
+        assert!(fixed.text.contains("%dir \"/usr/lib/Ollaya/lib\""));
+        for file in [
+            "/usr/bin/ollaya",
+            "/usr/lib/Ollaya/lib/data",
+            "/usr/lib/alias",
+        ] {
+            assert!(
+                fixed.text.lines().any(|l| l == format!("\"{file}\"")),
+                "{file}"
+            );
+        }
+        assert_eq!(fixed.text.matches("/usr/share/ollaya/50%%data").count(), 1);
+        assert!(fixed
+            .text
+            .contains("%config \"/usr/share/ollaya/50%%data\""));
+        assert!(!fixed.text.contains("/usr/lib/alias/lib/data"));
+        let build_only = fix_spec(spec, "demo", false, &tree).unwrap();
+        assert!(build_only.text.contains("%dir \"/usr/bin\""));
+        assert!(build_only.text.contains("\"/usr/bin/ollaya\""));
+        let work = temporary_dir("bare-dirs-rpm");
+        let spec_path = work.join("fixture.spec");
+        fs::write(&spec_path, &fixed.text).unwrap();
+        let rpm = rpmbuild(&tree, &spec_path, &machine_arch(), &work, &[]).unwrap();
+        let files = run(RPM, &["-qpl", rpm.to_str().unwrap()], None).unwrap();
+        assert!(files.ok);
+        for dir in ["/usr", "/usr/bin", "/usr/lib"] {
+            assert!(!files.stdout.lines().any(|p| p == dir), "{dir}");
+        }
+        for file in [
+            "/usr/bin/ollaya",
+            "/usr/lib/Ollaya/lib/data",
+            "/usr/lib/alias",
+            "/usr/share/ollaya/50%data",
+        ] {
+            assert!(files.stdout.lines().any(|p| p == file), "{file}");
+        }
+        fs::remove_dir_all(tree).unwrap();
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
     fn spec_keeps_automatic_dependencies() {
         let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n\n%files\n\"/opt/demo\"\n";
-        assert!(!fix_spec(spec, "demo", false)
+        assert!(!fix_spec(spec, "demo", false, Path::new("/nonexistent"))
             .unwrap()
             .text
             .contains("AutoReqProv: no"));
@@ -2434,7 +2827,9 @@ mod tests {
     #[test]
     fn upgrade_scripts_preserve_versions() {
         let spec = "Name: demo\nVersion: 2\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%pre\n#!/bin/sh\ntrue\n%post\n#!/bin/sh\ntrue\n%preun\n#!/bin/sh\ntrue\n%postun\n#!/bin/sh\ntrue\n%description\nDemo\n\n%files\n";
-        let fixed = fix_spec(spec, "demo", true).unwrap().text;
+        let fixed = fix_spec(spec, "demo", true, Path::new("/nonexistent"))
+            .unwrap()
+            .text;
         assert!(fixed.contains("set -- upgrade \"$DEB2RPM_OLD\""));
         assert!(fixed.contains("set -- configure \"$DEB2RPM_OLD\""));
         assert!(fixed.contains("set -- upgrade \"$DEB2RPM_NEW\""));
@@ -2700,7 +3095,9 @@ mod tests {
         let spec = format!(
             "Buildroot: {buildroot}\nName: demo\nVersion: 1\nRelease: 1\nSummary: probe {attack}\nLicense: see /usr/share/doc/demo/copyright\nDistribution: Debian\nGroup: Converted/utils\n\n%define _rpmdir ../\n%define _rpmfilename %%{{NAME}}-%%{{VERSION}}-%%{{RELEASE}}.%%{{ARCH}}.rpm\n%define _unpackaged_files_terminate_build 0\n\n%description\nprobe {attack}\n\n(Converted from a deb package by alien version 8.95.)\n\n%files\n%dir \"/opt/\"\n%dir \"/opt/demo/\"\n\"/opt/demo/plain.txt\"\n"
         );
-        let fixed = fix_spec(&spec, "demo", false).unwrap().text;
+        let fixed = fix_spec(&spec, "demo", false, Path::new("/nonexistent"))
+            .unwrap()
+            .text;
         assert!(fixed.contains(&format!("Summary: probe %%(touch {}", marker.display())));
         assert!(fixed.contains(&format!("%%(touch {}", marker.display())));
 
@@ -2934,6 +3331,46 @@ mod tests {
         }
         assert!(child.wait().unwrap().success());
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    #[ignore = "PTY worker for terminal lifecycle regression checks"]
+    fn terminal_lifecycle_worker() {
+        install_signal_handlers();
+        let scenario = env::var("DEB2RPM_TERMINAL_SCENARIO").unwrap();
+        if scenario == "pause" || scenario == "pause-signal" {
+            wait_for_enter().unwrap();
+            assert_eq!(interrupted(), scenario == "pause-signal");
+            return;
+        }
+        let log_path = env::var("DEB2RPM_TERMINAL_LOG").unwrap();
+        LOG.lock().unwrap().file = Some(fs::File::create(log_path).unwrap());
+        progress::start(false);
+        step(Stage::Installing, "Installing probe");
+        let script = if scenario == "interactive-signal" {
+            "trap 'exit 143' TERM; printf 'READY_FOR_SIGNAL\\n'; while :; do sleep 0.05; done"
+        } else if scenario == "descendant" {
+            "(sleep 2) & printf 'background pipe holder\\n'; exit 0"
+        } else if scenario == "native-tty" {
+            "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 90; exec 3<&1; [ \"$(stty size <&3)\" = '24 80' ] || exit 92; printf 'NATIVE_TTY_OK\\n'"
+        } else if scenario == "resize-tty" {
+            "exec 3<&1; printf 'READY_TO_RESIZE\\n'; IFS= read -r answer; size=$(stty size <&3); printf 'WINDOW_SIZE=%s\\n' \"$size\"; [ \"$size\" = '30 100' ]"
+        } else if scenario == "raw-lines" {
+            "saved=$(stty -g); trap 'stty \"$saved\"' EXIT; stty -opost; printf 'LAYOUT_FIRST\\nLAYOUT_SECOND\\n'; printf '\\033[A'; sleep 0.2"
+        } else {
+            "[ -t 0 ] || exit 90; printf 'PROBE_STDOUT\\n'; printf 'PROBE_STDERR\\n' >&2; printf 'Confirm probe: '; IFS= read -r answer; [ \"$answer\" = yes ] || exit 91; if [ \"$DEB2RPM_TERMINAL_SCENARIO\" = failure ]; then printf 'PROBE_FAILURE_DETAIL\\n' >&2; exit 7; fi"
+        };
+        let result = run_interactive("/bin/sh", &["-c", script]);
+        if scenario == "interactive-signal" {
+            assert!(interrupted());
+            assert!(result.is_err());
+            progress::finish(false, true);
+        } else {
+            let success = result.unwrap();
+            assert_eq!(success, scenario != "failure");
+            progress::finish(success, false);
+        }
+        out("PROBE_FINISHED\n");
     }
 
     #[test]
