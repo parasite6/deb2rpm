@@ -35,6 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod close_prompt;
 mod interactive_output;
 mod progress;
+mod tinfo_compat;
 use progress::Stage;
 
 // System tools by absolute path: ~/.linuxbrew/bin shadows some of them (gio, …) on this machine.
@@ -1444,7 +1445,68 @@ fn is_node_prebuild(path: &str) -> bool {
     })
 }
 
-// Only known Node prebuild layouts with an ELF-verified glibc counterpart are optional.
+fn native_glibc(elf: &DependencyElf, identity: [u8; 4]) -> bool {
+    elf.identity == identity
+        && elf.needed.iter().any(|n| n == "libc.so.6")
+        && !elf
+            .needed
+            .iter()
+            .any(|n| n.starts_with("libc.musl-") || n == "libc.so")
+}
+
+// These are dynamically loaded execution providers, not the CPU runtime itself.
+// Recognize only the upstream Node layout with a complete native runtime, and
+// retain requirements if any payload ELF directly links to the GPU provider.
+fn optional_onnx_provider(
+    elf: &DependencyElf,
+    elfs: &[DependencyElf],
+    identity: [u8; 4],
+    cpu: &str,
+) -> bool {
+    let Some((dir, name)) = elf.path.rsplit_once('/') else {
+        return false;
+    };
+    if !matches!(
+        name,
+        "libonnxruntime_providers_cuda.so" | "libonnxruntime_providers_tensorrt.so"
+    ) || !dir.ends_with(&format!(
+        "/node_modules/onnxruntime-node/bin/napi-v3/linux/{cpu}"
+    )) || !native_glibc(elf, identity)
+        || elfs.iter().any(|consumer| {
+            consumer
+                .needed
+                .iter()
+                .any(|needed| needed.rsplit('/').next() == Some(name))
+        })
+    {
+        return false;
+    }
+    [
+        "libonnxruntime.so.1",
+        "onnxruntime_binding.node",
+        "libonnxruntime_providers_shared.so",
+    ]
+    .iter()
+    .all(|name| {
+        elfs.iter().any(|native| {
+            native.path == format!("{dir}/{name}")
+                && native_glibc(native, identity)
+                && !native.needed.iter().any(|needed| {
+                    matches!(
+                        needed.rsplit('/').next(),
+                        Some(
+                            "libonnxruntime_providers_cuda.so"
+                                | "libonnxruntime_providers_tensorrt.so"
+                        )
+                    )
+                })
+                && (*name != "onnxruntime_binding.node"
+                    || native.needed.iter().any(|n| n == "libonnxruntime.so.1"))
+        })
+    })
+}
+
+// Only verified optional Node alternatives and independent ONNX GPU plugins.
 // Keep dependencies for arbitrary foreign binaries and musl-only applications.
 fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
     let (identity, platform) = match arch {
@@ -1454,6 +1516,15 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
     };
     let mut excluded = BTreeSet::new();
     for elf in elfs {
+        let cpu = if platform == "linux-x64" {
+            "x64"
+        } else {
+            "arm64"
+        };
+        if optional_onnx_provider(elf, elfs, identity, cpu) {
+            excluded.insert(elf.path.clone());
+            continue;
+        }
         if !is_node_prebuild(&elf.path) {
             continue;
         }
@@ -1464,6 +1535,7 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
             .any(|n| n.starts_with("libc.musl-") || n == "libc.so")
             && (elf.path.contains("-musl/")
                 || elf.path.contains("-musl.")
+                || elf.path.contains("/prebuilds/linuxmusl-")
                 || elf.path.ends_with(".musl.node"));
         if !foreign && !musl {
             continue;
@@ -1483,9 +1555,11 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
         let candidates = if musl {
             vec![
                 candidate
+                    .replace("/prebuilds/linuxmusl-", "/prebuilds/linux-")
                     .replace("-musl", "-gnu")
                     .replace(".musl.node", ".node"),
                 candidate
+                    .replace("/prebuilds/linuxmusl-", "/prebuilds/linux-")
                     .replace("-musl", "-glibc")
                     .replace(".musl.node", ".node"),
             ]
@@ -1494,15 +1568,9 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
         };
         if candidates.iter().any(|path| {
             path != &elf.path
-                && elfs.iter().any(|native| {
-                    &native.path == path
-                        && native.identity == identity
-                        && native.needed.iter().any(|n| n == "libc.so.6")
-                        && !native
-                            .needed
-                            .iter()
-                            .any(|n| n.starts_with("libc.musl-") || n == "libc.so")
-                })
+                && elfs
+                    .iter()
+                    .any(|native| &native.path == path && native_glibc(native, identity))
         }) {
             excluded.insert(elf.path.clone());
         }
@@ -1528,9 +1596,8 @@ fn prebuild_exclusions(tree: &Path, arch: &str) -> Res<Vec<String>> {
                         .to_str()
                         .ok_or("non-UTF-8 payload path")?
                 );
-                if !is_node_prebuild(&relative) {
-                    continue;
-                }
+                // Inspect all ELFs so a direct dependency from an unrelated
+                // executable prevents treating a GPU provider as optional.
                 let Some(identity) = elf_identity(&path) else {
                     continue;
                 };
@@ -1541,7 +1608,7 @@ fn prebuild_exclusions(tree: &Path, arch: &str) -> Res<Vec<String>> {
                 )?;
                 if !out.ok {
                     return Err(format!(
-                        "could not inspect prebuild {}: {}",
+                        "could not inspect ELF {}: {}",
                         path.display(),
                         out.stderr
                     ));
@@ -1592,14 +1659,36 @@ fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path, excluded: &[String
     // fakeroot: ownership in the payload comes from %defattr; this keeps rpmbuild from tripping over
     // files the unprivileged user can't stat the "real" owner of.
     // No post-processing: Fedora's brp scripts strip binaries, byte-compile Python, rewrite shebangs and
-    // add build-id links — the payload must stay byte-identical to the .deb. Multithreaded zstd -7
-    // instead of single-threaded -19 (minutes faster on big Electron apps, slightly larger rpm).
+    // add build-id links — the payload must stay byte-identical to the .deb.
+    // Low-cost zstd compression and bounded RPM workers keep local conversions
+    // responsive. Use at most half the available CPUs, capped at two workers.
+    let workers = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 2))
+        .unwrap_or(1);
+    let payload = format!("_binary_payload w3T{workers}.zstdio");
+    let build_cpus = format!("_smp_build_ncpus {workers}");
+    let build_threads = format!("_smp_build_nthreads {workers}");
+    let max_cpus = format!("_smp_ncpus_max {workers}");
+    let max_threads = format!("_smp_nthreads_max {workers}");
     for path in excluded {
         info(&format!(
-            "excluding optional incompatible prebuild from RPM requirements/provides: {path}"
+            "excluding optional native component from RPM requirements/provides: {path}"
         ));
     }
     let mut dependency_args = Vec::new();
+    if let Some(alternative) = tinfo_compat::alternative(dir, arch, excluded) {
+        info(&format!(
+            "using verified terminfo dependency alternative: {alternative}"
+        ));
+        let original = fs::read_to_string(spec).map_err(|e| e.to_string())?;
+        fs::write(spec, format!("Requires: {alternative}\n{original}"))
+            .map_err(|e| e.to_string())?;
+        // Replace exactly one generated capability with the explicit rich
+        // dependency above. The SONAME requirement and all other automatic
+        // requirements/provides remain generated normally.
+        let regex = dependency_exclude_regex(&[tinfo_compat::REQUIREMENT.into()]);
+        dependency_args.push(format!("__requires_exclude {regex}"));
+    }
     if !excluded.is_empty() {
         let regex = dependency_exclude_regex(excluded);
         dependency_args.push(format!("__requires_exclude_from {regex}"));
@@ -1619,7 +1708,15 @@ fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path, excluded: &[String
         "--define",
         "_build_id_links none",
         "--define",
-        "_binary_payload w7T0.zstdio",
+        &payload,
+        "--define",
+        &build_cpus,
+        "--define",
+        &build_threads,
+        "--define",
+        &max_cpus,
+        "--define",
+        &max_threads,
         "-bb",
         "--target",
         arch,
@@ -2438,6 +2535,11 @@ mod tests {
     fn mixed_libc_prebuilds_keep_glibc_and_standalone_musl() {
         for (musl, native, needed) in [
             (
+                "better-sqlite3/prebuilds/linuxmusl-x64.node",
+                "better-sqlite3/prebuilds/linux-x64.node",
+                "libc.musl-x86_64.so.1",
+            ),
+            (
                 "watcher-linux-x64-musl/watcher.node",
                 "watcher-linux-x64-glibc/watcher.node",
                 "libc.musl-x86_64.so.1",
@@ -2519,6 +2621,86 @@ mod tests {
                 addon(&path.replace("-musl/", "-gnu/"), 62, &["libc.so.6"]),
             ];
             assert!(dependency_exclusions(&elfs, "x86_64").is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn onnx_gpu_plugins_require_an_independent_native_runtime() {
+        let dir = "/opt/app/node_modules/onnxruntime-node/bin/napi-v3/linux/x64";
+        let elfs = vec![
+            addon(
+                &format!("{dir}/libonnxruntime_providers_cuda.so"),
+                62,
+                &["libc.so.6", "libcudart.so.12"],
+            ),
+            addon(
+                &format!("{dir}/libonnxruntime_providers_tensorrt.so"),
+                62,
+                &["libc.so.6", "libnvinfer.so.10"],
+            ),
+            addon(&format!("{dir}/libonnxruntime.so.1"), 62, &["libc.so.6"]),
+            addon(
+                &format!("{dir}/onnxruntime_binding.node"),
+                62,
+                &["libc.so.6", "libonnxruntime.so.1"],
+            ),
+            addon(
+                &format!("{dir}/libonnxruntime_providers_shared.so"),
+                62,
+                &["libc.so.6"],
+            ),
+        ];
+        let expected = vec![elfs[0].path.clone(), elfs[1].path.clone()];
+        assert_eq!(dependency_exclusions(&elfs, "x86_64"), expected);
+        assert!(dependency_exclusions(&elfs, "aarch64").is_empty());
+        for index in 2..5 {
+            let mut missing = elfs.clone();
+            missing.remove(index);
+            assert!(dependency_exclusions(&missing, "x86_64").is_empty());
+            for identity in [[2, 1, 183, 0], [1, 1, 62, 0], [2, 2, 0, 62]] {
+                let mut wrong = elfs.clone();
+                wrong[index].identity = identity;
+                assert!(dependency_exclusions(&wrong, "x86_64").is_empty());
+            }
+            let mut musl = elfs.clone();
+            musl[index].needed = vec!["libc.so".into()];
+            assert!(dependency_exclusions(&musl, "x86_64").is_empty());
+        }
+        for consumer in [2, 3, 4] {
+            let mut linked = elfs.clone();
+            linked[consumer]
+                .needed
+                .push("libonnxruntime_providers_cuda.so".into());
+            assert_eq!(
+                dependency_exclusions(&linked, "x86_64"),
+                Vec::<String>::new()
+            );
+        }
+        let mut linked = elfs.clone();
+        linked.push(addon(
+            "/opt/app/required-tool",
+            62,
+            &["libonnxruntime_providers_cuda.so"],
+        ));
+        assert_eq!(
+            dependency_exclusions(&linked, "x86_64"),
+            vec![elfs[1].path.clone()]
+        );
+        linked.last_mut().unwrap().needed = vec![elfs[0].path.clone()];
+        assert_eq!(
+            dependency_exclusions(&linked, "x86_64"),
+            vec![elfs[1].path.clone()]
+        );
+        for from in ["onnxruntime-node", "napi-v3/linux/x64"] {
+            let unrelated: Vec<_> = elfs
+                .iter()
+                .cloned()
+                .map(|mut elf| {
+                    elf.path = elf.path.replace(from, "unrelated");
+                    elf
+                })
+                .collect();
+            assert!(dependency_exclusions(&unrelated, "x86_64").is_empty());
         }
     }
 
@@ -2642,6 +2824,66 @@ mod tests {
             .success());
         let excluded = prebuild_exclusions(&tree, "x86_64").unwrap();
         assert_eq!(excluded.len(), 3);
+        // Exercise the flat linuxmusl naming and real ONNX shared-library
+        // layout through readelf, RPM's generators, and the advisory scan.
+        let sqlite = modules.join("better-sqlite3/prebuilds");
+        fs::create_dir_all(&sqlite).unwrap();
+        fs::copy(&native, sqlite.join("linux-x64.node")).unwrap();
+        fs::copy(&musl, sqlite.join("linuxmusl-x64.node")).unwrap();
+        let onnx = modules.join("onnxruntime-node/bin/napi-v3/linux/x64");
+        fs::create_dir_all(&onnx).unwrap();
+        let core = onnx.join("libonnxruntime.so.1");
+        let compile = |output: &Path, soname: &str, source: &Path, libraries: &[&Path]| {
+            assert!(Command::new("/usr/bin/gcc")
+                .args(["-shared", "-fPIC", "-Wl,--no-as-needed"])
+                .arg(format!("-Wl,-soname,{soname}"))
+                .arg(source)
+                .args(libraries)
+                .arg("-o")
+                .arg(output)
+                .status()
+                .unwrap()
+                .success());
+        };
+        compile(&core, "libonnxruntime.so.1", &work.join("addon.c"), &[]);
+        compile(
+            &onnx.join("onnxruntime_binding.node"),
+            "libonnxbindingprobe.so",
+            &work.join("addon.c"),
+            &[&core],
+        );
+        fs::copy(&native, onnx.join("libonnxruntime_providers_shared.so")).unwrap();
+        let cuda_stub = work.join("libcudart.so.12");
+        compile(&cuda_stub, "libcudart.so.12", &work.join("stub.c"), &[]);
+        compile(
+            &onnx.join("libonnxruntime_providers_cuda.so"),
+            "libonnxruntime_providers_cuda.so",
+            &work.join("addon.c"),
+            &[&cuda_stub],
+        );
+        let excluded = prebuild_exclusions(&tree, "x86_64").unwrap();
+        assert_eq!(excluded.len(), 5);
+        let required = modules.parent().unwrap().join("required-tool.so");
+        compile(
+            &required,
+            "librequiredprobe.so",
+            &work.join("addon.c"),
+            &[&onnx.join("libonnxruntime_providers_cuda.so")],
+        );
+        let linked = prebuild_exclusions(&tree, "x86_64").unwrap();
+        assert_eq!(linked.len(), 4);
+        assert!(!linked
+            .iter()
+            .any(|path| path.ends_with("libonnxruntime_providers_cuda.so")));
+        fs::remove_file(required).unwrap();
+        assert!(missing_libraries(&tree, &[])
+            .missing
+            .iter()
+            .any(|(lib, _)| lib == "libcudart.so.12"));
+        assert!(!missing_libraries(&tree, &excluded)
+            .missing
+            .iter()
+            .any(|(lib, _)| lib == "libcudart.so.12"));
         assert!(missing_libraries(&tree, &[])
             .missing
             .iter()
@@ -2653,9 +2895,22 @@ mod tests {
         let spec = work.join("probe.spec");
         fs::write(&spec, "Name: mixedprobe\nVersion: 1\nRelease: 1\nSummary: mixed ELF test\nLicense: MIT\n%description\nTest\n%files\n%defattr(-,root,root,-)\n\"/opt/T3 Code (Beta)\"\n").unwrap();
         let rpm = rpmbuild(&tree, &spec, "x86_64", &work, &excluded).unwrap();
+        let payload_flags = run(
+            RPM,
+            &["-qp", "--qf", "%{PAYLOADFLAGS}", rpm.to_str().unwrap()],
+            None,
+        )
+        .unwrap();
+        assert!(payload_flags.ok);
+        assert!(
+            matches!(payload_flags.stdout.trim(), "3T1" | "3T2"),
+            "{}",
+            payload_flags.stdout
+        );
         let requirements = run(RPM, &["-qp", "--requires", rpm.to_str().unwrap()], None).unwrap();
         assert!(requirements.ok);
         assert!(requirements.stdout.contains("libc.so.6(GLIBC_"));
+        assert!(!requirements.stdout.contains("libcudart.so.12"));
         assert!(
             !requirements.stdout.contains("libc.so()(64bit)"),
             "{}",
@@ -2669,6 +2924,8 @@ mod tests {
         let provides = run(RPM, &["-qp", "--provides", rpm.to_str().unwrap()], None).unwrap();
         assert!(provides.ok);
         assert!(provides.stdout.contains("libnativeprobe.so"));
+        assert!(provides.stdout.contains("libonnxruntime.so.1"));
+        assert!(!provides.stdout.contains("libonnxruntime_providers_cuda.so"));
         assert!(
             !provides.stdout.contains("libmuslsoprobe.so"),
             "{}",
@@ -2762,23 +3019,37 @@ mod tests {
     fn bare_directories_are_filtered_without_losing_recursive_payload() {
         let _guard = fork_lock_test_guard();
         let tree = temporary_dir("bare-dirs");
-        for dir in ["usr/bin", "usr/lib/Ollaya/lib", "usr/share/ollaya"] {
+        for dir in [
+            "usr/bin",
+            "usr/lib/Deb2rpmOwnershipFixture/lib",
+            "usr/share/deb2rpm-ownership-fixture",
+        ] {
             fs::create_dir_all(tree.join(dir)).unwrap();
         }
-        fs::write(tree.join("usr/bin/ollaya"), b"app").unwrap();
-        fs::write(tree.join("usr/lib/Ollaya/lib/data"), b"data").unwrap();
-        fs::write(tree.join("usr/share/ollaya/50%data"), b"data").unwrap();
-        std::os::unix::fs::symlink("Ollaya", tree.join("usr/lib/alias")).unwrap();
-        let spec = "Name: demo\nVersion: 1\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n%files\n\"/usr\"\n%config \"/usr/share/ollaya/50%data\"\n";
+        fs::write(tree.join("usr/bin/deb2rpm-ownership-fixture"), b"app").unwrap();
+        fs::write(
+            tree.join("usr/lib/Deb2rpmOwnershipFixture/lib/data"),
+            b"data",
+        )
+        .unwrap();
+        fs::write(
+            tree.join("usr/share/deb2rpm-ownership-fixture/50%data"),
+            b"data",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("Deb2rpmOwnershipFixture", tree.join("usr/lib/alias")).unwrap();
+        let spec = "Name: demo\nVersion: 1\nRelease: 1\nSummary: demo\nLicense: MIT\nGroup: Applications\n%description\nDemo\n%files\n\"/usr\"\n%config \"/usr/share/deb2rpm-ownership-fixture/50%data\"\n";
         let fixed = fix_spec(spec, "demo", true, &tree).unwrap();
         for dir in ["/usr", "/usr/bin", "/usr/lib"] {
             assert!(fixed.dropped_dirs.contains(&dir.to_string()), "{dir}");
             assert!(!fixed.text.lines().any(|l| l == format!("%dir \"{dir}\"")));
         }
-        assert!(fixed.text.contains("%dir \"/usr/lib/Ollaya/lib\""));
+        assert!(fixed
+            .text
+            .contains("%dir \"/usr/lib/Deb2rpmOwnershipFixture/lib\""));
         for file in [
-            "/usr/bin/ollaya",
-            "/usr/lib/Ollaya/lib/data",
+            "/usr/bin/deb2rpm-ownership-fixture",
+            "/usr/lib/Deb2rpmOwnershipFixture/lib/data",
             "/usr/lib/alias",
         ] {
             assert!(
@@ -2786,14 +3057,22 @@ mod tests {
                 "{file}"
             );
         }
-        assert_eq!(fixed.text.matches("/usr/share/ollaya/50%%data").count(), 1);
+        assert_eq!(
+            fixed
+                .text
+                .matches("/usr/share/deb2rpm-ownership-fixture/50%%data")
+                .count(),
+            1
+        );
         assert!(fixed
             .text
-            .contains("%config \"/usr/share/ollaya/50%%data\""));
+            .contains("%config \"/usr/share/deb2rpm-ownership-fixture/50%%data\""));
         assert!(!fixed.text.contains("/usr/lib/alias/lib/data"));
         let build_only = fix_spec(spec, "demo", false, &tree).unwrap();
         assert!(build_only.text.contains("%dir \"/usr/bin\""));
-        assert!(build_only.text.contains("\"/usr/bin/ollaya\""));
+        assert!(build_only
+            .text
+            .contains("\"/usr/bin/deb2rpm-ownership-fixture\""));
         let work = temporary_dir("bare-dirs-rpm");
         let spec_path = work.join("fixture.spec");
         fs::write(&spec_path, &fixed.text).unwrap();
@@ -2804,10 +3083,10 @@ mod tests {
             assert!(!files.stdout.lines().any(|p| p == dir), "{dir}");
         }
         for file in [
-            "/usr/bin/ollaya",
-            "/usr/lib/Ollaya/lib/data",
+            "/usr/bin/deb2rpm-ownership-fixture",
+            "/usr/lib/Deb2rpmOwnershipFixture/lib/data",
             "/usr/lib/alias",
-            "/usr/share/ollaya/50%data",
+            "/usr/share/deb2rpm-ownership-fixture/50%data",
         ] {
             assert!(files.stdout.lines().any(|p| p == file), "{file}");
         }
