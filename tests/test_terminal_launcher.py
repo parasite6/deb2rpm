@@ -1,7 +1,9 @@
+import configparser
 import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import tempfile
 import unittest
 
@@ -110,6 +112,30 @@ class TerminalLauncherTests(unittest.TestCase):
         launcher = bin_path / "deb2rpm-terminal"
         self.assertTrue(os.access(launcher, os.X_OK))
         self.assertEqual(launcher.read_text(), (ROOT / "terminal-launch.sh").read_text())
+
+        service = data_path / "kio/servicemenus/deb2rpm.desktop"
+        self.assertTrue(service.is_file(), "installer must register the Dolphin action")
+        self.assertTrue(os.access(service, os.X_OK))
+        entry = configparser.ConfigParser(interpolation=None)
+        entry.read(service)
+        metadata = entry["Desktop Entry"]
+        self.assertEqual(metadata["Type"], "Service")
+        self.assertIn("application/vnd.debian.binary-package;", metadata["MimeType"])
+        self.assertEqual(metadata["X-KDE-Protocols"], "file")
+        self.assertEqual(metadata["X-KDE-RequiredNumberOfUrls"], "1")
+        action = entry["Desktop Action convertInstall"]
+        self.assertEqual(action["Name"], "Convert & Install")
+        # Exercise the installed action's command through the real launcher,
+        # replacing Dolphin's file field with a filename containing shell syntax.
+        command = shlex.split(action["Exec"])
+        package = str(self.root / "app $(touch nope) 'quoted'.deb")
+        command = [package if arg == "%f" else arg for arg in command]
+        self.fake("kitty")
+        self.env["TERMINAL"] = "kitty"
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.record.read_text())[1:],
+                         ["--", str(bin_path / "deb2rpm"), "--pause", package])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+Name=deb2rpm
+MimeType=application/vnd.debian.binary-package;application/x-deb;
+Actions=convertInstall;
+X-KDE-Priority=TopLevel
+X-KDE-Protocols=file
+X-KDE-RequiredNumberOfUrls=1
+
+[Desktop Action convertInstall]
+Name=Convert & Install
+Icon=package-x-generic
+Exec=deb2rpm-terminal --pause %f

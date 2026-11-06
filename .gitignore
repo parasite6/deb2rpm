@@ -4,3 +4,6 @@ build/
 dist/
 audit*
 !audit.md
+.idea/
+__pycache__/
+*.py[cod]
