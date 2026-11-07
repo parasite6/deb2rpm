@@ -91,7 +91,7 @@ deb2rpm -o ./rpms app.deb
 | `--pause`            | Wait for Enter before exit      |
 | `-h`, `--help`       | Show usage                      |
 
-Only one `.deb` is accepted per invocation.
+Only one `.deb` is accepted per invocation. The package name comes from metadata inside the archive, regardless of its filename. DNF handles upgrades for the same RPM package name. Replacing a differently named package requires appropriate replacement metadata (such as `Obsoletes`); overlapping icons alone do not establish that relationship.
 
 ---
 
@@ -104,7 +104,7 @@ Only one `.deb` is accepted per invocation.
 - **Handles optional ONNX Runtime GPU plugins** in the known `onnxruntime-node` layout when compatible native core, binding, and shared-provider libraries are bundled and no payload ELF directly requires the plugin. Only the exact CUDA/TensorRT plugin files are excluded from automatic requirements, provides, and the advisory scan; all files remain in the payload. Using GPU acceleration still requires the matching GPU libraries. Required libraries and incompatible symbol-version requirements remain enforced.
 - **Keeps build resource use bounded** with zstd level 3 compression and at most two compression/RPM workers (one on smaller CPU allocations). This reduces local build CPU and memory costs in exchange for somewhat larger RPM files.
 - **Checks Fedora terminfo compatibility** for the known Debian ABI-6 symbol label. On native x86_64, a verified, unmodified `ncurses-libs` library can be recorded as an explicit alternative to the versioned requirement only after checking every affected consumer's imported symbols and data-object sizes. The original versioned option, normal SONAME dependency, other dependencies, and payload remain intact; uncertain cases retain the original requirement.
-- **Checks file ownership conflicts** before installation and blocks downgrades unless `--allow-downgrade` is set.
+- **Leaves payload file conflicts to DNF/RPM's transaction checks.** Existing application files, desktop entries, and icons stay in the RPM; deb2rpm does not reject them just because an installed package owns the same path. Shared directory claims are cleaned separately. Downgrades remain blocked unless `--allow-downgrade` is set.
 - **Reinstall behavior** when the built version matches the installed version.
 - **Advisory ELF library inspection** (no binary execution) checks shared-library requirements without running packaged binaries.
 

@@ -1761,54 +1761,6 @@ fn rpmbuild(dir: &Path, spec: &Path, arch: &str, work: &Path, excluded: &[String
 // dnf's transaction solver resolves full requirements, self-provides and repositories.
 // A failed advisory query must never change the package's dependency metadata.
 
-/// Files in the rpm that already exist and belong to another package (dnf would refuse).
-fn conflicts(rpm: &str, pkg: &str) -> Res<Vec<String>> {
-    let list = run(
-        RPM,
-        &["-qp", "--qf", "[%{FILENAMES}\t%{FILEMODES:perms}\n]", rpm],
-        None,
-    )?;
-    if !list.ok {
-        return Err(format!("can't inspect RPM files: {}", list.stderr));
-    }
-    let existing = list
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter(|(path, perms)| {
-            !perms.starts_with('d') && Path::new(path).symlink_metadata().is_ok()
-        })
-        .map(|(path, _)| path.to_string())
-        .collect::<Vec<_>>();
-    cache_owners(&existing);
-    let mut out = Vec::new();
-    for line in list.stdout.lines() {
-        let Some((path, perms)) = line.split_once('\t') else {
-            continue;
-        };
-        if perms.starts_with('d') {
-            continue; // shared directories are fine
-        }
-        let p = Path::new(path);
-        if p.symlink_metadata().is_err() {
-            continue;
-        }
-        match owners(path) {
-            Some(o) if o.iter().any(|n| n != pkg) => {
-                out.push(format!("{path} (owned by {})", o.join(", ")))
-            }
-            Some(o) if o.is_empty() => warn(&format!(
-                "{path} already exists and no package owns it; it will be replaced"
-            )),
-            None => {
-                return Err("could not read installed file ownership; refusing installation".into())
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
 #[derive(Default)]
 struct LibraryReport {
     missing: BTreeSet<(String, String)>,
@@ -2245,6 +2197,16 @@ fn convert(opts: Opts) -> Res<()> {
 }
 
 fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()> {
+    build_and_install_with(opts, deb, arch, work, run_interactive)
+}
+
+fn build_and_install_with(
+    opts: &Opts,
+    deb: &Deb,
+    arch: &str,
+    work: &Path,
+    mut install: impl FnMut(&str, &[&str]) -> Res<bool>,
+) -> Res<()> {
     // space: unpacked tree (twice while alien copies) + the rpm
     let need = deb
         .installed_kb
@@ -2358,13 +2320,10 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
         return Ok(());
     }
 
-    let clashes = conflicts(&rpm_s, &name)?;
-    if !clashes.is_empty() {
-        return Err(format!(
-            "files already owned by other packages:\n  {}",
-            clashes.join("\n  ")
-        ));
-    }
+    // Only DNF/RPM sees which installed packages the transaction upgrades or
+    // replaces. An owned payload file alone is not grounds to reject the RPM.
+    // Shared directory claims were already cleaned in fix_spec; keep all files
+    // and let the transaction enforce real file conflicts without force flags.
     let installed = rpm_query(&["-q", "--qf", fmt, &name]);
     if !deb.depends.is_empty() {
         warn("Debian Depends are not translated; dnf checks RPM dependencies, not every Debian runtime assumption");
@@ -2393,7 +2352,7 @@ fn build_and_install(opts: &Opts, deb: &Deb, arch: &str, work: &Path) -> Res<()>
     }
     args.push(&rpm_s);
     INSTALL_STARTED.store(true, Ordering::SeqCst);
-    if !run_interactive(SUDO, &args)? {
+    if !install(SUDO, &args)? {
         return Err(format!(
             "dnf {verb} failed or was cancelled; the rpm is at {rpm_s}"
         ));
@@ -2456,6 +2415,87 @@ mod tests {
         ));
         fs::create_dir(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn payload_file_overlap_is_left_to_the_install_transaction() {
+        let _guard = fork_lock_test_guard();
+        // Use an existing owned file to reproduce the old pre-install veto.
+        // The fixture only writes below /tmp; the installer callback records
+        // the command and refuses it, so neither sudo nor DNF can execute.
+        let overlap = "/usr/bin/sh";
+        let ownership = query_owners(&[overlap.into()]).unwrap();
+        assert!(!ownership[overlap].is_empty());
+        let root = temporary_dir("payload-overlap");
+        let tree = root.join("input");
+        fs::create_dir_all(tree.join("DEBIAN")).unwrap();
+        fs::create_dir_all(tree.join("usr/bin")).unwrap();
+        fs::write(
+            tree.join("usr/bin/sh"),
+            b"fixture payload, never executed\n",
+        )
+        .unwrap();
+        fs::write(tree.join("DEBIAN/control"),
+            "Package: deb2rpm-overlap-fixture\nVersion: 1.0\nArchitecture: all\nMaintainer: Test <test@example.invalid>\nDescription: Payload ownership handoff fixture\n").unwrap();
+        // The archive basename must not determine the resulting RPM identity.
+        let archive = root.join("egs.deb");
+        let packed = run(
+            DPKG_DEB,
+            &[
+                "--build",
+                "--root-owner-group",
+                tree.to_str().unwrap(),
+                archive.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(packed.ok, "{}", packed.stderr);
+        let deb = read_deb(&archive).unwrap();
+        let opts = Opts {
+            deb: archive,
+            build_only: false,
+            output: None,
+            yes: false,
+            allow_downgrade: false,
+            no_scripts: true,
+            keep_work: true,
+            force_arch: false,
+            pause: false,
+            delete_work: false,
+        };
+        let work = root.join("work");
+        fs::create_dir(&work).unwrap();
+        let mut invocation = None;
+        let result = build_and_install_with(&opts, &deb, "noarch", &work, |prog, args| {
+            invocation = Some((
+                prog.to_string(),
+                args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            ));
+            Ok(false)
+        });
+        INSTALL_STARTED.store(false, Ordering::SeqCst);
+        assert!(
+            invocation.is_some(),
+            "must reach the installer despite file overlap: {result:?}"
+        );
+        let (program, args) = invocation.unwrap();
+        assert_eq!(program, SUDO);
+        assert_eq!(&args[..2], &[DNF, "install"]);
+        assert_eq!(args.len(), 3); // No force, replacefiles, or dependency bypass.
+        let rpm = &args[2];
+        assert_eq!(
+            rpm_query(&["-qp", "--qf", "%{NAME}", rpm]).as_deref(),
+            Some("deb2rpm-overlap-fixture")
+        );
+        let files = rpm_query(&["-qpl", rpm]).unwrap();
+        assert!(files.lines().any(|path| path == overlap));
+        assert!(!files.lines().any(|path| path == "/usr/bin"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("dnf install failed or was cancelled"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
