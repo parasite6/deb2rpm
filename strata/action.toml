@@ -1,0 +1,24 @@
+# Strata custom action (docs/custom-actions.md in Strata). install.sh copies it to
+# ~/.config/strata/actions/deb2rpm/action.toml and replaces the program line with
+# the installed launcher's absolute path.
+schema_version = 1
+id = "deb2rpm"
+name = "Convert & Install"
+description = "deb2rpm: convert this .deb to an .rpm and install it with dnf, in a terminal"
+icon = "download"
+enabled = true
+menu = "top"
+
+[when]
+kinds = ["file"]
+extensions = ["deb"]
+min_items = 1
+max_items = 1
+
+[run]
+runtime = "command"
+program = "deb2rpm-terminal"
+args = ["--pause", "{paths}"]
+mode = "whole-selection"
+working_directory = "parent"
+confirm = false

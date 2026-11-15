@@ -25,7 +25,7 @@ deb2rpm -n app.deb
 deb2rpm -o ./rpms app.deb
 ```
 
-**Run as your normal user** — `sudo` is only used for `dnf` installation. In Dolphin, right-click a local `.deb` and choose **Convert & Install**. Other file managers can use **Open With → Convert & install (deb2rpm)**. Both launch in a terminal with `--pause`.
+**Run as your normal user** — `sudo` is only used for `dnf` installation. In Dolphin or Strata, right-click a local `.deb` and choose **Convert & Install**. Other file managers can use **Open With → Convert & install (deb2rpm)**. Both launch in a terminal with `--pause`.
 
 ---
 
@@ -166,6 +166,8 @@ bash install.sh
 The installer builds the release binary to `~/.local/bin/deb2rpm`, installs a `deb2rpm-terminal` launcher beside it, and adds a desktop entry at `~/.local/share/applications/deb2rpm.desktop` (`XDG_BIN_HOME` / `XDG_DATA_HOME` override these). It uses Blaze when available, otherwise Cargo. The launcher respects a `TERMINAL` executable override, then uses `xdg-terminal-exec` when installed. Without that utility, it reads XDG terminal preference lists for common terminals, including Kitty, instead of choosing an arbitrary installed terminal. It waits for Enter after conversion (`--pause`). Custom terminal desktop entries should use `xdg-terminal-exec`; `TERMINAL` must name an executable, without shell arguments.
 
 It also installs the Dolphin service menu from `dolphin/deb2rpm.desktop` to `~/.local/share/kio/servicemenus/deb2rpm.desktop`, with executable permission and the installed launcher's absolute path. **Convert & Install** appears when exactly one local `.deb` is selected. It converts the package and starts the usual interactive installation, retaining the sudo and DNF prompts. If the action is disabled, enable **deb2rpm** in Dolphin's **Settings → Configure Dolphin → Context Menu**.
+
+For Strata, it installs the custom action from `strata/action.toml` to `~/.config/strata/actions/deb2rpm/action.toml` (`XDG_CONFIG_HOME` overrides this). The folder is owner-only and the program line points at the installed launcher. **Convert & Install** appears in the right-click menu itself, not under **Actions**, when exactly one local `.deb` is selected, and runs the same launcher with `--pause`. Strata lists it in its Jobs panel as running until the terminal closes. If you turn it off in Strata's **Settings → Actions**, re-running the installer keeps it off.
 
 ---
 

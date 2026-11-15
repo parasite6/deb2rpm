@@ -3,6 +3,7 @@
 #   ~/.local/bin/deb2rpm                                  the tool (deb2rpm --help)
 #   ~/.local/share/applications/deb2rpm.desktop           Files: right-click a .deb → Open With → deb2rpm
 #   ~/.local/share/kio/servicemenus/deb2rpm.desktop        Dolphin: right-click a .deb → Convert & Install
+#   ~/.config/strata/actions/deb2rpm/action.toml           Strata: right-click a .deb → Convert & Install
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -17,7 +18,8 @@ BIN_TMP=$(mktemp "$BIN/.deb2rpm.XXXXXXXX")
 DESKTOP_TMP=
 LAUNCHER_TMP=
 SERVICE_TMP=
-trap 'rm -f -- "$BIN_TMP" "${DESKTOP_TMP:-}" "${LAUNCHER_TMP:-}" "${SERVICE_TMP:-}"' EXIT
+STRATA_TMP=
+trap 'rm -f -- "$BIN_TMP" "${DESKTOP_TMP:-}" "${LAUNCHER_TMP:-}" "${SERVICE_TMP:-}" "${STRATA_TMP:-}"' EXIT
 install -m755 target/release/deb2rpm "$BIN_TMP"
 mv -f -- "$BIN_TMP" "$BIN/deb2rpm"
 LAUNCHER_TMP=$(mktemp "$BIN/.deb2rpm-terminal.XXXXXXXX")
@@ -58,5 +60,31 @@ done < dolphin/deb2rpm.desktop > "$SERVICE_TMP"
 chmod 755 "$SERVICE_TMP"
 mv -f -- "$SERVICE_TMP" "$SERVICES/deb2rpm.desktop"
 
+# Strata custom action: one owner-only folder holding action.toml. Strata refuses
+# symlinked action folders and manifests, so never write through one.
+STRATA_ACTIONS="${XDG_CONFIG_HOME:-$HOME/.config}/strata/actions"
+STRATA_DIR="$STRATA_ACTIONS/deb2rpm"
+if [[ -L $STRATA_ACTIONS || -L $STRATA_DIR || -L $STRATA_DIR/action.toml ]]; then
+    echo "Strata: skipped, $STRATA_DIR (or its parent) is a symlink, which Strata won't load." >&2
+else
+    mkdir -p -m 700 "$STRATA_ACTIONS" "$STRATA_DIR"
+    chmod 700 "$STRATA_DIR"
+    STRATA_TMP=$(mktemp "$STRATA_DIR/.action.toml.XXXXXXXX")  # mktemp creates it 0600
+    # TOML basic string: escape backslashes and quotes in the launcher path.
+    PROGRAM=$(printf '%s' "$BIN/deb2rpm-terminal" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    # Keep the action off if it was turned off in Strata's Settings → Actions.
+    enabled=true
+    if grep -qx 'enabled = false' "$STRATA_DIR/action.toml" 2>/dev/null; then enabled=false; fi
+    while IFS= read -r line || [[ -n $line ]]; do
+        case "$line" in
+            'program = '*) printf 'program = "%s"\n' "$PROGRAM" ;;
+            'enabled = '*) printf 'enabled = %s\n' "$enabled" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < strata/action.toml > "$STRATA_TMP"
+    mv -f -- "$STRATA_TMP" "$STRATA_DIR/action.toml"
+fi
+
 echo "installed: $BIN/deb2rpm ($("$BIN/deb2rpm" --help | head -1))"
 echo "Dolphin: right-click a local .deb → Convert & Install"
+echo "Strata: right-click a local .deb → Convert & Install"

@@ -1536,7 +1536,8 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
             && (elf.path.contains("-musl/")
                 || elf.path.contains("-musl.")
                 || elf.path.contains("/prebuilds/linuxmusl-")
-                || elf.path.ends_with(".musl.node"));
+                || elf.path.ends_with(".musl.node")
+                || elf.path.contains(&format!("/musl_{cpu}/")));
         if !foreign && !musl {
             continue;
         }
@@ -1554,6 +1555,7 @@ fn dependency_exclusions(elfs: &[DependencyElf], arch: &str) -> Vec<String> {
         }
         let candidates = if musl {
             vec![
+                candidate.replace(&format!("/musl_{cpu}/"), &format!("/linux_{cpu}/")),
                 candidate
                     .replace("/prebuilds/linuxmusl-", "/prebuilds/linux-")
                     .replace("-musl", "-gnu")
@@ -2574,6 +2576,11 @@ mod tests {
     #[test]
     fn mixed_libc_prebuilds_keep_glibc_and_standalone_musl() {
         for (musl, native, needed) in [
+            (
+                "@koromix/koffi-linux-x64/musl_x64/koffi.node",
+                "@koromix/koffi-linux-x64/linux_x64/koffi.node",
+                "libc.musl-x86_64.so.1",
+            ),
             (
                 "better-sqlite3/prebuilds/linuxmusl-x64.node",
                 "better-sqlite3/prebuilds/linux-x64.node",
